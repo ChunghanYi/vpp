@@ -79,23 +79,28 @@ typedef enum
 #define FLOODGUARD_V_MAX_INDEX	 ((1U << (64 - FLOODGUARD_V_INDEX_SHIFT)) - 1)
 
 /* Feature arcs a node is attached to on an interface (floodguard_if_t.arcs):
- * the storm node on each L2 input arc, and the victim node on the IPv4 one. */
+ * the storm node on each L2 input arc, the victim node on the IPv4 one, and
+ * the WAN reply node on the IPv4 L2 output arc. */
 #define FLOODGUARD_ARC_STORM_IP4   (1 << 0)
 #define FLOODGUARD_ARC_STORM_IP6   (1 << 1)
 #define FLOODGUARD_ARC_STORM_NONIP (1 << 2)
 #define FLOODGUARD_ARC_VICTIM	   (1 << 3)
+#define FLOODGUARD_ARC_WAN_REPLY   (1 << 4)
 
 /* Per-interface state. policer: Broadcast Filter policers, indexed by
  * kind - 1 (~0 = none). enabled: storm/victim policing ("interface ...
  * enable"). ip6_drop: every IPv6 frame entering the bridge on this
  * interface is dropped — the product never forwards IPv6 ("interface ...
  * ip6-drop enable"), set independently of enabled so a port out of the
- * Policy binding scope keeps it. arcs is what those two need attached. */
+ * Policy binding scope keeps it. wan_reply: server replies leaving this
+ * (WAN) interface skip its output ACL ("interface ... wan-reply enable",
+ * see floodguard_main_t.wan_reply_*). arcs is what these need attached. */
 typedef struct
 {
   u32 policer[FLOODGUARD_N_L2_KIND];
   u8 enabled;
   u8 ip6_drop;
+  u8 wan_reply;
   u8 arcs; /* FLOODGUARD_ARC_* currently attached; 0 = none */
 } floodguard_if_t;
 
@@ -187,6 +192,18 @@ typedef struct
   u32 challenge_whitelist_max;
   volatile u32 n_whitelist;
   u32 challenge_whitelist_ttl_sec;
+
+  /* WAN reply ports ("floodguard wan-reply ports ..."): a TCP/UDP packet
+   * leaving a wan_reply interface whose source port is set here is a
+   * server's reply on a WAN Service Port and skips the output ACL, so it
+   * creates no ACL session (node.c's floodguard-wan-reply). Bitmaps by
+   * host-order port. wan_reply_all: every IPv4 packet skips it (the WAN
+   * allow-list admits all protocols and ports). Written only by the CLI,
+   * which runs with the workers stopped. */
+  u8 wan_reply_tcp[65536 / 8];
+  u8 wan_reply_udp[65536 / 8];
+  u8 wan_reply_all;
+  vlib_simple_counter_main_t wan_reply_skipped;
 
   /* The policer plugin's state, resolved on first use through its
    * exported accessors (policer.h). */

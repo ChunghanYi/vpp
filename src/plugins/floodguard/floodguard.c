@@ -8,6 +8,8 @@
  *                                         [ctrl <policer>] [multicast <policer>]
  *   floodguard interface <interface> disable
  *   floodguard interface <interface> ip6-drop enable|disable
+ *   floodguard interface <interface> wan-reply enable|disable
+ *   floodguard wan-reply ports [tcp <list>] [udp <list>] [all]
  *   floodguard flood syn|udp|icmp rate <pps> burst <packets>
  *   floodguard flood share <workers>
  *   floodguard victim add <ip4> syn|udp|icmp [port <n>]
@@ -24,6 +26,13 @@
  * policer is set. "ip6-drop" drops every IPv6 frame entering the bridge on
  * the interface (storm IPv6 node, ahead of the ACL), independently of
  * enable/disable.
+ *
+ * "wan-reply" (WAN interface, independent of enable/disable too) lets
+ * server replies — and ICMP destination-unreachable/time-exceeded, always —
+ * leave without passing the output ACL (node.c's floodguard-wan-reply);
+ * "wan-reply ports" replaces the whole port set —
+ * <list> as "80,443,8000-8100", "all" for every IPv4 packet, no argument
+ * to clear it.
  *
  * "flood" sets one flood type's limit for the whole box (rate 0 = not
  * limited); every victim armed for that type gets its own bucket with
@@ -243,7 +252,8 @@ floodguard_policer_index (floodguard_main_t *fm, u8 *name, u32 *index)
 
 /* floodguard_wanted_arcs: the nodes ifc's settings need — the victim node
  * while enabled, the storm nodes while some Broadcast Filter policer is
- * set, and the IPv6 storm node while ip6_drop is on. */
+ * set, the IPv6 storm node while ip6_drop is on, and the WAN reply node
+ * while wan_reply is on. */
 static u8
 floodguard_wanted_arcs (floodguard_if_t *ifc)
 {
@@ -262,6 +272,8 @@ floodguard_wanted_arcs (floodguard_if_t *ifc)
     }
   if (ifc->ip6_drop)
     want |= FLOODGUARD_ARC_STORM_IP6;
+  if (ifc->wan_reply)
+    want |= FLOODGUARD_ARC_WAN_REPLY;
   return want;
 }
 
@@ -278,6 +290,7 @@ floodguard_set_arcs (floodguard_if_t *ifc, u32 sw_if_index, u8 want)
     { FLOODGUARD_ARC_STORM_IP6, "l2-input-ip6", "floodguard-l2-ip6" },
     { FLOODGUARD_ARC_STORM_NONIP, "l2-input-nonip", "floodguard-l2-nonip" },
     { FLOODGUARD_ARC_VICTIM, "l2-input-ip4", "floodguard-victim" },
+    { FLOODGUARD_ARC_WAN_REPLY, "l2-output-ip4", "floodguard-wan-reply" },
   };
   int i;
 
@@ -299,7 +312,7 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
   floodguard_main_t *fm = &floodguard_main;
   vnet_main_t *vnm = vnet_get_main ();
   u32 sw_if_index = ~0, policer[FLOODGUARD_N_L2_KIND];
-  int enable = -1, ip6_drop = -1, i;
+  int enable = -1, ip6_drop = -1, wan_reply = -1, i;
   clib_error_t *error = 0;
   u8 *name = 0;
 
@@ -313,6 +326,10 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	ip6_drop = 1;
       else if (unformat (input, "ip6-drop disable"))
 	ip6_drop = 0;
+      else if (unformat (input, "wan-reply enable"))
+	wan_reply = 1;
+      else if (unformat (input, "wan-reply disable"))
+	wan_reply = 0;
       else if (unformat (input, "enable"))
 	enable = 1;
       else if (unformat (input, "disable"))
@@ -339,15 +356,26 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				      format_unformat_error, input);
 	}
     }
-  if (sw_if_index == ~0 || (enable < 0) == (ip6_drop < 0))
+  if (sw_if_index == ~0 ||
+      (enable >= 0) + (ip6_drop >= 0) + (wan_reply >= 0) != 1)
     return clib_error_return (
-      0, "specify an interface and enable|disable or ip6-drop enable|disable");
+      0, "specify an interface and one of enable|disable, ip6-drop "
+	 "enable|disable or wan-reply enable|disable");
+  /* The WAN reply node skips to the arc end, so it must be the ACL node's
+   * only follower on this arc (node.c). */
+  if (wan_reply == 1 &&
+      vnet_feature_is_enabled ("l2-output-ip4", "gso-l2-ip4", sw_if_index))
+    return clib_error_return (
+      0, "wan-reply: gso-l2-ip4 is enabled on %U", format_vnet_sw_if_index_name,
+      vnm, sw_if_index);
 
   floodguard_if_t empty = { .policer = { ~0, ~0, ~0, ~0 } };
   vec_validate_init_empty (fm->ifs, sw_if_index, empty);
   floodguard_if_t *ifc = vec_elt_at_index (fm->ifs, sw_if_index);
   if (ip6_drop >= 0)
     ifc->ip6_drop = ip6_drop;
+  else if (wan_reply >= 0)
+    ifc->wan_reply = wan_reply;
   else
     {
       /* enable replaces the whole storm/victim configuration; disable
@@ -601,6 +629,82 @@ floodguard_show_victim (clib_bihash_kv_8_8_t *kv, void *arg)
   return BIHASH_WALK_CONTINUE;
 }
 
+/* floodguard_ports_from_bitmap: set dst's bits from a parsed port list. */
+static clib_error_t *
+floodguard_ports_from_bitmap (u8 *dst, uword *ports, const char *proto)
+{
+  uword port;
+
+  if (clib_bitmap_last_set (ports) > 65535)
+    return clib_error_return (0, "%s: port above 65535", proto);
+  clib_bitmap_foreach (port, ports)
+    dst[port >> 3] |= 1 << (port & 7);
+  return 0;
+}
+
+static clib_error_t *
+floodguard_wan_reply_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				 vlib_cli_command_t *cmd)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u8 tcp[sizeof (fm->wan_reply_tcp)] = {}, udp[sizeof (fm->wan_reply_udp)] = {};
+  uword *ports = 0;
+  clib_error_t *error = 0;
+  u8 all = 0;
+
+  if (!unformat (input, "ports"))
+    return clib_error_return (0, "expected 'ports'");
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "tcp %U", unformat_bitmap_list, &ports))
+	error = floodguard_ports_from_bitmap (tcp, ports, "tcp");
+      else if (unformat (input, "udp %U", unformat_bitmap_list, &ports))
+	error = floodguard_ports_from_bitmap (udp, ports, "udp");
+      else if (unformat (input, "all"))
+	all = 1;
+      else
+	error = clib_error_return (0, "unknown input '%U'",
+				   format_unformat_error, input);
+      clib_bitmap_free (ports);
+      if (error)
+	return error;
+    }
+  /* Not mp-safe: the workers are stopped while the sets change. */
+  clib_memcpy_fast (fm->wan_reply_tcp, tcp, sizeof (tcp));
+  clib_memcpy_fast (fm->wan_reply_udp, udp, sizeof (udp));
+  fm->wan_reply_all = all;
+  return 0;
+}
+
+/* format_floodguard_ports: a port bitmap as "80,443,8000-8100" ("none"). */
+static u8 *
+format_floodguard_ports (u8 *s, va_list *args)
+{
+  const u8 *bitmap = va_arg (*args, const u8 *);
+  u32 port = 0, first;
+  int n = 0;
+
+  while (port < 65536)
+    {
+      if (!((bitmap[port >> 3] >> (port & 7)) & 1))
+	{
+	  port++;
+	  continue;
+	}
+      first = port;
+      while (port + 1 < 65536 &&
+	     ((bitmap[(port + 1) >> 3] >> ((port + 1) & 7)) & 1))
+	port++;
+      s = format (s, "%s%u", n++ ? "," : "", first);
+      if (port != first)
+	s = format (s, "-%u", port);
+      port++;
+    }
+  if (!n)
+    s = format (s, "none");
+  return s;
+}
+
 static clib_error_t *
 show_floodguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			    vlib_cli_command_t *cmd)
@@ -630,15 +734,24 @@ show_floodguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	continue;
       vlib_cli_output (vm,
 		       "    %U: %s, arp %U, broadcast %U, ctrl %U, multicast %U, "
-		       "ip6-drop %s",
+		       "ip6-drop %s, wan-reply %s",
 		       format_vnet_sw_if_index_name, vnm, sw_if_index,
 		       ifc->enabled ? "enabled" : "disabled",
 		       format_floodguard_policer, fm, ifc->policer[0],
 		       format_floodguard_policer, fm, ifc->policer[1],
 		       format_floodguard_policer, fm, ifc->policer[2],
 		       format_floodguard_policer, fm, ifc->policer[3],
-		       ifc->ip6_drop ? "on" : "off");
+		       ifc->ip6_drop ? "on" : "off",
+		       ifc->wan_reply ? "on" : "off");
     }
+  if (fm->wan_reply_all)
+    vlib_cli_output (vm, "  WAN reply ports: all");
+  else
+    vlib_cli_output (vm, "  WAN reply ports: tcp %U, udp %U, + ICMP errors",
+		     format_floodguard_ports, fm->wan_reply_tcp,
+		     format_floodguard_ports, fm->wan_reply_udp);
+  vlib_cli_output (vm, "  WAN replies past the output ACL: %llu",
+		   vlib_get_simple_counter (&fm->wan_reply_skipped, 0));
   vlib_cli_output (vm, "  Victims: %u", fm->n_victims);
   /* virtserver parses the "<type>: ... conform <n>, violate <n>" lines
    * (ddos/floodguard_vpp.go). */
@@ -815,7 +928,8 @@ VLIB_CLI_COMMAND (floodguard_interface_command, static) = {
   .short_help = "floodguard interface <interface> enable [arp <policer>] "
 		"[broadcast <policer>] [ctrl <policer>] [multicast <policer>] "
 		"| floodguard interface <interface> disable "
-		"| floodguard interface <interface> ip6-drop enable|disable",
+		"| floodguard interface <interface> ip6-drop enable|disable "
+		"| floodguard interface <interface> wan-reply enable|disable",
   .function = floodguard_interface_command_fn,
 };
 
@@ -840,6 +954,13 @@ VLIB_CLI_COMMAND (floodguard_challenge_command, static) = {
   .short_help = "floodguard syn-challenge [whitelist-ttl <seconds>] "
 		"[whitelist-size <n>]",
   .function = floodguard_challenge_command_fn,
+};
+
+VLIB_CLI_COMMAND (floodguard_wan_reply_command, static) = {
+  .path = "floodguard wan-reply",
+  .short_help =
+    "floodguard wan-reply ports [tcp <list>] [udp <list>] [all]",
+  .function = floodguard_wan_reply_command_fn,
 };
 
 VLIB_CLI_COMMAND (show_floodguard_command, static) = {
@@ -885,6 +1006,10 @@ floodguard_init (vlib_main_t *vm)
 	vlib_validate_simple_counter (cm, 0);
 	vlib_zero_simple_counter (cm, 0);
       }
+  fm->wan_reply_skipped.name = "wan-reply-skipped";
+  fm->wan_reply_skipped.stat_segment_name = "/floodguard/wan-reply/skipped";
+  vlib_validate_simple_counter (&fm->wan_reply_skipped, 0);
+  vlib_zero_simple_counter (&fm->wan_reply_skipped, 0);
   fm->challenge_whitelist_ttl_sec =
     FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_TTL_SEC;
   fm->challenge_whitelist_max = FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_MAX;

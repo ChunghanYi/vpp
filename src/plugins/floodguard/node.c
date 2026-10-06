@@ -33,6 +33,23 @@
  *     UDP (port-limited or all)             -> victim's UDP limit
  *     ICMP                                  -> victim's ICMP limit
  *
+ *   floodguard-wan-reply — l2-output-ip4 arc of the WAN interface, BEFORE
+ *   the ACL output node: a TCP/UDP packet whose source port is a WAN
+ *   Service Port (floodguard_main_t.wan_reply_*) is a protected server's
+ *   reply and goes straight to l2-output-feat-arc-end, skipping the output
+ *   ACL. That ACL is a single permit+reflect-any rule kept for the replies
+ *   of connections the LAN side starts; on a server reply it only created
+ *   a session per client 5-tuple — one per spoofed SYN, ACK or UDP packet
+ *   of a flood before detection, enough to fill the session table. Its
+ *   peer's packets need no session: they carry that port as destination,
+ *   which the WAN input allow-list already permits. And since server
+ *   connections no longer have a session, every packet of them goes
+ *   through the input ACLs, so an attacker blocked mid-connection is cut
+ *   off at once. An ICMP destination-unreachable or time-exceeded leaving
+ *   the WAN skips it too, whatever the port set: it is never answered, so
+ *   its session was pure cost — one per spoofed source when a flood
+ *   reaches a closed allowed port before detection (port unreachable).
+ *
  * SYN Reset Challenge (RFC 793 §3.4 case 2, same mechanism as the kernel
  * mode's handle_syn_reset_challenge and the earlier synchallenge plugin it
  * replaced): a bare SYN from an unverified source is answered with
@@ -81,6 +98,7 @@
 #include <vnet/ip/ip4_packet.h>
 #include <vnet/tcp/tcp_packet.h>
 #include <vnet/udp/udp_packet.h>
+#include <vnet/ip/icmp46_packet.h>
 #include <vnet/l2/l2_input.h>
 #include <vnet/feature/feature.h>
 
@@ -733,6 +751,155 @@ VLIB_NODE_FN (floodguard_victim_node)
   return frame->n_vectors;
 }
 
+/* ------------------------------------------------------------------------
+ * WAN reply node
+ * ------------------------------------------------------------------------ */
+
+typedef enum
+{
+  FLOODGUARD_WAN_REPLY_NEXT_SKIP, /* past the output ACL, see above */
+  FLOODGUARD_WAN_REPLY_N_NEXT,
+} floodguard_wan_reply_next_t;
+
+typedef struct
+{
+  u32 sw_if_index;
+  u16 sport;
+  u8 proto;
+  u8 skip;
+} floodguard_wan_reply_trace_t;
+
+static u8 *
+format_floodguard_wan_reply_trace (u8 *s, va_list *args)
+{
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  floodguard_wan_reply_trace_t *t =
+    va_arg (*args, floodguard_wan_reply_trace_t *);
+
+  return format (s, "floodguard-wan-reply: sw_if_index %u proto %u sport %u %s",
+		 t->sw_if_index, t->proto, t->sport,
+		 t->skip ? "skip-acl" : "acl");
+}
+
+static_always_inline int
+floodguard_port_set (const u8 *bitmap, u16 port)
+{
+  return (bitmap[port >> 3] >> (port & 7)) & 1;
+}
+
+/* floodguard_wan_reply_skip: nonzero if b is a server reply on a WAN
+ * Service Port, or an ICMP error. Only the first fragment carries the L4
+ * header; the others go through the ACL as before. */
+static_always_inline int
+floodguard_wan_reply_skip (floodguard_main_t *fm, vlib_buffer_t *b,
+			   floodguard_wan_reply_trace_t *t)
+{
+  u8 *eth = vlib_buffer_get_current (b);
+  u8 *end = eth + b->current_length;
+  ip4_header_t *ip = (ip4_header_t *) (eth + vnet_buffer (b)->l2.l2_len);
+  const u8 *bitmap;
+
+  if ((u8 *) (ip + 1) > end)
+    return 0;
+  t->proto = ip->protocol;
+  if (fm->wan_reply_all)
+    return 1;
+  if (ip4_get_fragment_offset (ip) != 0)
+    return 0;
+  if (ip->protocol == IP_PROTOCOL_ICMP)
+    {
+      icmp46_header_t *icmp =
+	(icmp46_header_t *) ((u8 *) ip + ip4_header_bytes (ip));
+      if ((u8 *) (icmp + 1) > end)
+	return 0;
+      t->sport = icmp->type; /* trace shows the type in the port field */
+      return icmp->type == ICMP4_destination_unreachable ||
+	     icmp->type == ICMP4_time_exceeded;
+    }
+  if (ip->protocol == IP_PROTOCOL_TCP)
+    bitmap = fm->wan_reply_tcp;
+  else if (ip->protocol == IP_PROTOCOL_UDP)
+    bitmap = fm->wan_reply_udp;
+  else
+    return 0;
+  /* TCP and UDP both start with the source port. */
+  u16 *l4 = (u16 *) ((u8 *) ip + ip4_header_bytes (ip));
+  if ((u8 *) (l4 + 1) > end)
+    return 0;
+  t->sport = clib_net_to_host_u16 (l4[0]);
+  return floodguard_port_set (bitmap, t->sport);
+}
+
+VLIB_NODE_FN (floodguard_wan_reply_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 n_skipped = 0;
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+
+  while (n_left > 0)
+    {
+      floodguard_wan_reply_trace_t t = {};
+      int skip;
+
+      if (n_left > 2)
+	vlib_prefetch_buffer_header (b[2], LOAD);
+
+      skip = floodguard_wan_reply_skip (fm, b[0], &t);
+      if (skip)
+	{
+	  next[0] = FLOODGUARD_WAN_REPLY_NEXT_SKIP;
+	  n_skipped++;
+	}
+      else
+	vnet_feature_next_u16 (next, b[0]);
+
+      if (PREDICT_FALSE ((node->flags & VLIB_NODE_FLAG_TRACE) &&
+			 (b[0]->flags & VLIB_BUFFER_IS_TRACED)))
+	{
+	  floodguard_wan_reply_trace_t *tr =
+	    vlib_add_trace (vm, node, b[0], sizeof (*tr));
+	  *tr = t;
+	  tr->sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_TX];
+	  tr->skip = skip;
+	}
+
+      b++;
+      next++;
+      n_left--;
+    }
+
+  if (n_skipped)
+    vlib_increment_simple_counter (&fm->wan_reply_skipped, vm->thread_index,
+				   0, n_skipped);
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  return frame->n_vectors;
+}
+
+/* The skip next is the output arc's end node, never a second
+ * vnet_feature_next: a feature config's next index is a slot of the node
+ * before it, so the one after the ACL node is only valid from the ACL
+ * node. The arc end continues with the L2 output feature bitmap, which
+ * is where the ACL node's own next leads as long as nothing else is on
+ * this arc after it — floodguard.c refuses wan-reply on an interface with
+ * gso-l2-ip4, the only other l2-output-ip4 feature. */
+VLIB_REGISTER_NODE (floodguard_wan_reply_node) = {
+  .name = "floodguard-wan-reply",
+  .vector_size = sizeof (u32),
+  .format_trace = format_floodguard_wan_reply_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_next_nodes = FLOODGUARD_WAN_REPLY_N_NEXT,
+  .next_nodes = { [FLOODGUARD_WAN_REPLY_NEXT_SKIP] =
+		    "l2-output-feat-arc-end" },
+};
+
 #define FLOODGUARD_NODE(sym, nm)                                              \
   VLIB_REGISTER_NODE (sym) = {                                                \
     .name = nm,                                                               \
@@ -774,4 +941,10 @@ VNET_FEATURE_INIT (floodguard_victim_feature, static) = {
   .node_name = "floodguard-victim",
   .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-l2", "floodguard-l2-ip4"),
   .runs_before = VNET_FEATURES ("l2-input-feat-arc-end"),
+};
+
+VNET_FEATURE_INIT (floodguard_wan_reply_feature, static) = {
+  .arc_name = "l2-output-ip4",
+  .node_name = "floodguard-wan-reply",
+  .runs_before = VNET_FEATURES ("acl-plugin-out-ip4-l2"),
 };
