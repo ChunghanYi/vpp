@@ -7,7 +7,10 @@
  *   floodguard interface <interface> enable [arp <policer>] [broadcast <policer>]
  *                                         [ctrl <policer>] [multicast <policer>]
  *   floodguard interface <interface> disable
- *   floodguard victim add <ip4> syn|udp|icmp policer <policer> [port <n>]
+ *   floodguard interface <interface> ip6-drop enable|disable
+ *   floodguard flood syn|udp|icmp rate <pps> burst <packets>
+ *   floodguard flood share <workers>
+ *   floodguard victim add <ip4> syn|udp|icmp [port <n>]
  *   floodguard victim add <ip4> syn-challenge
  *   floodguard victim del <ip4> syn|udp|icmp|syn-challenge
  *   floodguard victim clear
@@ -18,7 +21,14 @@
  * (a policer left out = that kind is not policed). The victim node is
  * always attached to an enabled interface (victim policing and the SYN
  * Reset Challenge); the storm nodes only while some Broadcast Filter
- * policer is set.
+ * policer is set. "ip6-drop" drops every IPv6 frame entering the bridge on
+ * the interface (storm IPv6 node, ahead of the ACL), independently of
+ * enable/disable.
+ *
+ * "flood" sets one flood type's limit for the whole box (rate 0 = not
+ * limited); every victim armed for that type gets its own bucket with
+ * that limit, split evenly over the workers polling the victim
+ * interfaces' rx queues ("flood share", see floodguard_flood_share).
  */
 
 #include <sys/random.h>
@@ -43,6 +53,17 @@ static const char *const floodguard_flood_keywords[FLOODGUARD_N_FLOOD] = {
   "syn", "udp", "icmp"
 };
 
+static const u64 floodguard_flood_bits[FLOODGUARD_N_FLOOD] = {
+  FLOODGUARD_V_SYN, FLOODGUARD_V_UDP, FLOODGUARD_V_ICMP
+};
+
+static const char *const
+  floodguard_flood_stat_names[FLOODGUARD_N_FLOOD][FLOODGUARD_N_FLOOD_COUNTER] = {
+    { "/floodguard/flood/syn/conform", "/floodguard/flood/syn/violate" },
+    { "/floodguard/flood/udp/conform", "/floodguard/flood/udp/violate" },
+    { "/floodguard/flood/icmp/conform", "/floodguard/flood/icmp/violate" },
+  };
+
 static const char *const floodguard_drop_counter_names[FLOODGUARD_N_KIND] = {
   [FLOODGUARD_KIND_NONE] = "none",
   [FLOODGUARD_KIND_ARP] = "arp",
@@ -53,6 +74,7 @@ static const char *const floodguard_drop_counter_names[FLOODGUARD_N_KIND] = {
   [FLOODGUARD_KIND_UDP] = "udp",
   [FLOODGUARD_KIND_ICMP] = "icmp",
   [FLOODGUARD_KIND_SYN_CHALLENGE] = "syn-challenge",
+  [FLOODGUARD_KIND_IPV6] = "ipv6",
 };
 
 static const char *const floodguard_drop_stat_names[FLOODGUARD_N_KIND] = {
@@ -65,6 +87,7 @@ static const char *const floodguard_drop_stat_names[FLOODGUARD_N_KIND] = {
   [FLOODGUARD_KIND_UDP] = "/floodguard/drops/udp",
   [FLOODGUARD_KIND_ICMP] = "/floodguard/drops/icmp",
   [FLOODGUARD_KIND_SYN_CHALLENGE] = "/floodguard/drops/syn-challenge",
+  [FLOODGUARD_KIND_IPV6] = "/floodguard/drops/ipv6",
 };
 
 static const char *const
@@ -92,6 +115,68 @@ floodguard_challenge_count (floodguard_main_t *fm,
 			    floodguard_challenge_counter_t c)
 {
   return vlib_get_simple_counter (&fm->challenge_counters[c], 0);
+}
+
+/* floodguard_default_threads: the share count until virtserver sets one —
+ * every worker, so a limit errs on the strict side. */
+static u32
+floodguard_default_threads (void)
+{
+  return clib_max (vlib_num_workers (), 1);
+}
+
+/* floodguard_flood_share: split flood type i's limit evenly over
+ * n_share_threads workers. Main thread. ticks_per_token is the "limited" switch
+ * the workers test, so it is written last when a limit is set and first
+ * when it is removed. */
+static void
+floodguard_flood_share (vlib_main_t *vm, floodguard_main_t *fm, int i)
+{
+  floodguard_flood_t *f = &fm->flood[i];
+  u32 n = fm->n_share_threads;
+  u64 rate, burst, tpt;
+
+  if (!f->rate_pps)
+    {
+      f->ticks_per_token = 0;
+      return;
+    }
+  rate = clib_max (f->rate_pps / n, 1);
+  burst = clib_max (f->burst / n, 1);
+  tpt = clib_max ((u64) vm->clib_time.clocks_per_second / rate, 1);
+  f->burst_per_thread = burst;
+  f->fill_ticks = burst * tpt;
+  f->ticks_per_token = tpt;
+}
+
+/* floodguard_victim_free: release a victim record (CLI barrier). */
+static void
+floodguard_victim_free (floodguard_main_t *fm, u32 index)
+{
+  floodguard_victim_t *fv = pool_elt_at_index (fm->victim_pool, index);
+  vec_free (fv->threads);
+  pool_put (fm->victim_pool, fv);
+}
+
+/* floodguard_victim_alloc: a new victim record with empty buckets and
+ * zeroed counters (CLI barrier; a pool index can be reused). */
+static u32
+floodguard_victim_alloc (floodguard_main_t *fm)
+{
+  floodguard_victim_t *fv;
+  u32 index, t, c;
+
+  pool_get_zero (fm->victim_pool, fv);
+  vec_validate_aligned (fv->threads, vlib_get_n_threads () - 1,
+			CLIB_CACHE_LINE_BYTES);
+  index = fv - fm->victim_pool;
+  for (t = 0; t < FLOODGUARD_N_FLOOD; t++)
+    for (c = 0; c < FLOODGUARD_N_FLOOD_COUNTER; c++)
+      {
+	vlib_validate_simple_counter (&fm->victim_counters[t][c], index);
+	vlib_zero_simple_counter (&fm->victim_counters[t][c], index);
+      }
+  return index;
 }
 
 /* floodguard_whitelist_buckets: one bucket per two whitelist entries. */
@@ -156,6 +241,30 @@ floodguard_policer_index (floodguard_main_t *fm, u8 *name, u32 *index)
   return 0;
 }
 
+/* floodguard_wanted_arcs: the nodes ifc's settings need — the victim node
+ * while enabled, the storm nodes while some Broadcast Filter policer is
+ * set, and the IPv6 storm node while ip6_drop is on. */
+static u8
+floodguard_wanted_arcs (floodguard_if_t *ifc)
+{
+  u8 want = 0;
+  int i, storm = 0;
+
+  for (i = 0; i < FLOODGUARD_N_L2_KIND; i++)
+    if (ifc->policer[i] != ~0)
+      storm = 1;
+  if (ifc->enabled)
+    {
+      want |= FLOODGUARD_ARC_VICTIM;
+      if (storm)
+	want |= FLOODGUARD_ARC_STORM_IP4 | FLOODGUARD_ARC_STORM_IP6 |
+		FLOODGUARD_ARC_STORM_NONIP;
+    }
+  if (ifc->ip6_drop)
+    want |= FLOODGUARD_ARC_STORM_IP6;
+  return want;
+}
+
 static void
 floodguard_set_arcs (floodguard_if_t *ifc, u32 sw_if_index, u8 want)
 {
@@ -190,7 +299,7 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
   floodguard_main_t *fm = &floodguard_main;
   vnet_main_t *vnm = vnet_get_main ();
   u32 sw_if_index = ~0, policer[FLOODGUARD_N_L2_KIND];
-  int enable = -1, any = 0, i;
+  int enable = -1, ip6_drop = -1, i;
   clib_error_t *error = 0;
   u8 *name = 0;
 
@@ -200,7 +309,11 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
       int matched = 0;
-      if (unformat (input, "enable"))
+      if (unformat (input, "ip6-drop enable"))
+	ip6_drop = 1;
+      else if (unformat (input, "ip6-drop disable"))
+	ip6_drop = 0;
+      else if (unformat (input, "enable"))
 	enable = 1;
       else if (unformat (input, "disable"))
 	enable = 0;
@@ -218,7 +331,6 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		if ((error = floodguard_policer_index (fm, name, &policer[i])))
 		  return error;
 		name = 0;
-		any = 1;
 		matched = 1;
 		break;
 	      }
@@ -227,27 +339,24 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				      format_unformat_error, input);
 	}
     }
-  if (sw_if_index == ~0 || enable < 0)
-    return clib_error_return (0, "specify an interface and enable|disable");
+  if (sw_if_index == ~0 || (enable < 0) == (ip6_drop < 0))
+    return clib_error_return (
+      0, "specify an interface and enable|disable or ip6-drop enable|disable");
 
   floodguard_if_t empty = { .policer = { ~0, ~0, ~0, ~0 } };
   vec_validate_init_empty (fm->ifs, sw_if_index, empty);
   floodguard_if_t *ifc = vec_elt_at_index (fm->ifs, sw_if_index);
-  if (!enable)
+  if (ip6_drop >= 0)
+    ifc->ip6_drop = ip6_drop;
+  else
     {
-      floodguard_set_arcs (ifc, sw_if_index, 0);
+      /* enable replaces the whole storm/victim configuration; disable
+       * clears it. */
+      ifc->enabled = enable;
       for (i = 0; i < FLOODGUARD_N_L2_KIND; i++)
-	ifc->policer[i] = ~0;
-      return 0;
+	ifc->policer[i] = enable ? policer[i] : ~0;
     }
-  for (i = 0; i < FLOODGUARD_N_L2_KIND; i++)
-    ifc->policer[i] = policer[i];
-  floodguard_set_arcs (ifc, sw_if_index,
-		       FLOODGUARD_ARC_VICTIM |
-			 (any ? FLOODGUARD_ARC_STORM_IP4 |
-				  FLOODGUARD_ARC_STORM_IP6 |
-				  FLOODGUARD_ARC_STORM_NONIP :
-				0));
+  floodguard_set_arcs (ifc, sw_if_index, floodguard_wanted_arcs (ifc));
   return 0;
 }
 
@@ -258,9 +367,7 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
   floodguard_main_t *fm = &floodguard_main;
   ip4_address_t addr;
   int is_add = -1, clear = 0, type = -1, i;
-  u32 port = 0, pi = ~0;
-  u8 *name = 0;
-  clib_error_t *error = 0;
+  u32 port = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -270,12 +377,6 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	is_add = 0;
       else if (unformat (input, "clear"))
 	clear = 1;
-      else if (unformat (input, "policer %s", &name))
-	{
-	  if ((error = floodguard_policer_index (fm, name, &pi)))
-	    return error;
-	  name = 0;
-	}
       else if (unformat (input, "syn-challenge"))
 	type = FLOODGUARD_N_FLOOD;
       else if (unformat (input, "port %u", &port))
@@ -299,6 +400,10 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (clear)
     {
+      floodguard_victim_t *fv;
+      pool_foreach (fv, fm->victim_pool)
+	vec_free (fv->threads);
+      pool_free (fm->victim_pool);
       clib_bihash_free_8_8 (&fm->victims);
       clib_bihash_init_8_8 (&fm->victims, "floodguard victims",
 			    FLOODGUARD_VICTIM_BUCKETS,
@@ -311,13 +416,11 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
       0, "specify add|del <ip4> and syn|udp|icmp|syn-challenge");
   if (type == FLOODGUARD_N_FLOOD)
     {
-      if (pi != ~0 || port)
-	return clib_error_return (0, "syn-challenge takes no policer or port");
+      if (port)
+	return clib_error_return (0, "syn-challenge takes no port");
       if (is_add)
 	floodguard_challenge_tables (fm);
     }
-  else if (is_add && pi == ~0)
-    return clib_error_return (0, "specify policer <name>");
   if (port && type == FLOODGUARD_N_FLOOD - 1)
     return clib_error_return (0, "icmp has no port");
 
@@ -325,6 +428,7 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
   kv.key = addr.as_u32;
   int exists = clib_bihash_search_8_8 (&fm->victims, &kv, &val) == 0;
   u64 v = exists ? val.value : 0;
+  u64 was = v;
 
   switch (type)
     {
@@ -348,22 +452,93 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (is_add)
 	v |= FLOODGUARD_V_SYN_CHALLENGE;
     }
-  if (is_add && type < FLOODGUARD_N_FLOOD)
-    fm->flood_policer[type] = pi;
-
   if (v & FLOODGUARD_V_ANY)
     {
+      if (!exists)
+	{
+	  if (pool_elts (fm->victim_pool) > FLOODGUARD_V_MAX_INDEX)
+	    return clib_error_return (0, "victim table full");
+	  v |= (u64) floodguard_victim_alloc (fm) << FLOODGUARD_V_INDEX_SHIFT;
+	}
+      else if (type < FLOODGUARD_N_FLOOD &&
+	       !(was & floodguard_flood_bits[type]))
+	{
+	  /* Newly armed type: its buckets start full (last_tick 0). */
+	  floodguard_victim_t *fv =
+	    pool_elt_at_index (fm->victim_pool, FLOODGUARD_V_INDEX (v));
+	  floodguard_victim_thread_t *vt;
+	  vec_foreach (vt, fv->threads)
+	    clib_memset (&vt->bucket[type], 0, sizeof (vt->bucket[type]));
+	}
       kv.value = v;
       if (clib_bihash_add_del_8_8 (&fm->victims, &kv, 1))
-	return clib_error_return (0, "victim table full");
+	{
+	  if (!exists)
+	    floodguard_victim_free (fm, FLOODGUARD_V_INDEX (v));
+	  return clib_error_return (0, "victim table full");
+	}
       if (!exists)
 	fm->n_victims++;
     }
   else if (exists)
     {
       clib_bihash_add_del_8_8 (&fm->victims, &kv, 0);
+      floodguard_victim_free (fm, FLOODGUARD_V_INDEX (v));
       fm->n_victims--;
     }
+  return 0;
+}
+
+static clib_error_t *
+floodguard_flood_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			     vlib_cli_command_t *cmd)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u32 rate = ~0, burst = ~0, share = 0;
+  int type = -1, i;
+
+  if (unformat (input, "share %u", &share))
+    {
+      if (share < 1 || share > vlib_get_n_threads ())
+	return clib_error_return (0, "share must be 1-%u",
+				  vlib_get_n_threads ());
+      if (share != fm->n_share_threads)
+	{
+	  fm->n_share_threads = share;
+	  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
+	    floodguard_flood_share (vm, fm, i);
+	}
+      return 0;
+    }
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "rate %u", &rate))
+	;
+      else if (unformat (input, "burst %u", &burst))
+	;
+      else
+	{
+	  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
+	    if (unformat (input, floodguard_flood_keywords[i]))
+	      {
+		type = i;
+		break;
+	      }
+	  if (i == FLOODGUARD_N_FLOOD)
+	    return clib_error_return (0, "unknown input '%U'",
+				      format_unformat_error, input);
+	}
+    }
+  if (type < 0 || rate == ~0 || burst == ~0)
+    return clib_error_return (
+      0, "specify syn|udp|icmp rate <pps> burst <packets>");
+  if (rate && !burst)
+    return clib_error_return (0, "burst must be > 0");
+
+  fm->flood[type].rate_pps = rate;
+  fm->flood[type].burst = burst;
+  floodguard_flood_share (vm, fm, type);
   return 0;
 }
 
@@ -390,9 +565,12 @@ static int
 floodguard_show_victim (clib_bihash_kv_8_8_t *kv, void *arg)
 {
   floodguard_show_ctx_t *ctx = arg;
+  floodguard_main_t *fm = &floodguard_main;
   ip4_address_t addr = { .as_u32 = (u32) kv->key };
   u64 v = kv->value;
+  u32 index = FLOODGUARD_V_INDEX (v);
   u8 *s = format (0, "  %U:", format_ip4_address, &addr);
+  int t;
 
   if (v & FLOODGUARD_V_SYN)
     s = FLOODGUARD_V_SYN_PORT (v) ?
@@ -408,6 +586,17 @@ floodguard_show_victim (clib_bihash_kv_8_8_t *kv, void *arg)
     s = format (s, " syn-challenge");
   vlib_cli_output (ctx->vm, "%v", s);
   vec_free (s);
+  /* virtserver parses these lines (ddos/floodguard_vpp.go). */
+  for (t = 0; t < FLOODGUARD_N_FLOOD; t++)
+    if (v & (floodguard_flood_bits[t] |
+	     (t == 0 ? FLOODGUARD_V_SYN_CHALLENGE : 0)))
+      vlib_cli_output (
+	ctx->vm, "    %s conform %llu violate %llu",
+	floodguard_flood_keywords[t],
+	vlib_get_simple_counter (
+	  &fm->victim_counters[t][FLOODGUARD_FLOOD_CONFORM], index),
+	vlib_get_simple_counter (
+	  &fm->victim_counters[t][FLOODGUARD_FLOOD_VIOLATE], index));
   ctx->n++;
   return BIHASH_WALK_CONTINUE;
 }
@@ -440,18 +629,38 @@ show_floodguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (!ifc->arcs)
 	continue;
       vlib_cli_output (vm,
-		       "    %U: arp %U, broadcast %U, ctrl %U, multicast %U",
+		       "    %U: %s, arp %U, broadcast %U, ctrl %U, multicast %U, "
+		       "ip6-drop %s",
 		       format_vnet_sw_if_index_name, vnm, sw_if_index,
+		       ifc->enabled ? "enabled" : "disabled",
 		       format_floodguard_policer, fm, ifc->policer[0],
 		       format_floodguard_policer, fm, ifc->policer[1],
 		       format_floodguard_policer, fm, ifc->policer[2],
-		       format_floodguard_policer, fm, ifc->policer[3]);
+		       format_floodguard_policer, fm, ifc->policer[3],
+		       ifc->ip6_drop ? "on" : "off");
     }
-  vlib_cli_output (vm, "  Victims: %u (syn %U, udp %U, icmp %U)",
-		   fm->n_victims, format_floodguard_policer, fm,
-		   fm->flood_policer[0], format_floodguard_policer, fm,
-		   fm->flood_policer[1], format_floodguard_policer, fm,
-		   fm->flood_policer[2]);
+  vlib_cli_output (vm, "  Victims: %u", fm->n_victims);
+  /* virtserver parses the "<type>: ... conform <n>, violate <n>" lines
+   * (ddos/floodguard_vpp.go). */
+  vlib_cli_output (vm, "  Flood limits (split over %u worker%s):",
+		   fm->n_share_threads, fm->n_share_threads == 1 ? "" : "s");
+  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
+    {
+      floodguard_flood_t *f = &fm->flood[i];
+      u64 conform = vlib_get_simple_counter (
+	&fm->flood_counters[i][FLOODGUARD_FLOOD_CONFORM], 0);
+      u64 violate = vlib_get_simple_counter (
+	&fm->flood_counters[i][FLOODGUARD_FLOOD_VIOLATE], 0);
+      if (f->rate_pps)
+	vlib_cli_output (vm,
+			 "    %s: rate %u pps, burst %u, conform %llu, "
+			 "violate %llu",
+			 floodguard_flood_keywords[i], f->rate_pps, f->burst,
+			 conform, violate);
+      else
+	vlib_cli_output (vm, "    %s: off, conform %llu, violate %llu",
+			 floodguard_flood_keywords[i], conform, violate);
+    }
   vlib_cli_output (vm, "  Drops:");
   for (i = FLOODGUARD_KIND_ARP; i < FLOODGUARD_N_KIND; i++)
     vlib_cli_output (vm, "    %-13s %llu", floodguard_drop_counter_names[i],
@@ -605,17 +814,25 @@ VLIB_CLI_COMMAND (floodguard_interface_command, static) = {
   .path = "floodguard interface",
   .short_help = "floodguard interface <interface> enable [arp <policer>] "
 		"[broadcast <policer>] [ctrl <policer>] [multicast <policer>] "
-		"| floodguard interface <interface> disable",
+		"| floodguard interface <interface> disable "
+		"| floodguard interface <interface> ip6-drop enable|disable",
   .function = floodguard_interface_command_fn,
 };
 
 VLIB_CLI_COMMAND (floodguard_victim_command, static) = {
   .path = "floodguard victim",
-  .short_help = "floodguard victim add <ip4> syn|udp|icmp policer <policer> "
-		"[port <n>] | floodguard victim add <ip4> syn-challenge | "
+  .short_help = "floodguard victim add <ip4> syn|udp|icmp [port <n>] | "
+		"floodguard victim add <ip4> syn-challenge | "
 		"floodguard victim del <ip4> syn|udp|icmp|syn-challenge | "
 		"floodguard victim clear",
   .function = floodguard_victim_command_fn,
+};
+
+VLIB_CLI_COMMAND (floodguard_flood_command, static) = {
+  .path = "floodguard flood",
+  .short_help = "floodguard flood syn|udp|icmp rate <pps> burst <packets> | "
+		"floodguard flood share <workers>",
+  .function = floodguard_flood_command_fn,
 };
 
 VLIB_CLI_COMMAND (floodguard_challenge_command, static) = {
@@ -639,8 +856,7 @@ floodguard_init (vlib_main_t *vm)
 
   fm->vlib_main = vm;
   fm->vnet_main = vnet_get_main ();
-  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
-    fm->flood_policer[i] = ~0;
+  fm->n_share_threads = floodguard_default_threads ();
   clib_bihash_init_8_8 (&fm->victims, "floodguard victims",
 			FLOODGUARD_VICTIM_BUCKETS, FLOODGUARD_VICTIM_MEMORY);
   for (i = 0; i < FLOODGUARD_N_KIND; i++)
@@ -660,6 +876,15 @@ floodguard_init (vlib_main_t *vm)
       vlib_validate_simple_counter (&fm->challenge_counters[i], 0);
       vlib_zero_simple_counter (&fm->challenge_counters[i], 0);
     }
+  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
+    for (int c = 0; c < FLOODGUARD_N_FLOOD_COUNTER; c++)
+      {
+	vlib_simple_counter_main_t *cm = &fm->flood_counters[i][c];
+	cm->name = (char *) floodguard_flood_stat_names[i][c];
+	cm->stat_segment_name = (char *) floodguard_flood_stat_names[i][c];
+	vlib_validate_simple_counter (cm, 0);
+	vlib_zero_simple_counter (cm, 0);
+      }
   fm->challenge_whitelist_ttl_sec =
     FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_TTL_SEC;
   fm->challenge_whitelist_max = FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_MAX;

@@ -15,6 +15,9 @@
  * Port ACL -> flood victim protection):
  *
  *   floodguard-l2-ip4/-ip6/-nonip — L2 input arcs, BEFORE the ACL node:
+ *     any IPv6 frame, interface ip6-drop on  -> dropped (the product never
+ *                                             forwards IPv6; the IPv4 arc
+ *                                             never reaches this node)
  *     ARP (any destination)                 -> interface ARP policer
  *     dst ff:ff:ff:ff:ff:ff                 -> interface broadcast policer
  *     dst 01:80:c2:00:00:0x                 -> L2 control policer
@@ -26,9 +29,9 @@
  *   blocklist and WAN Service Port ACL already applied), IPv4 dst = armed
  *   victim:
  *     TCP SYN/RST, SYN Reset Challenge      -> challenge (see below)
- *     TCP with SYN (port-limited or all)    -> SYN policer
- *     UDP (port-limited or all)             -> UDP policer
- *     ICMP                                  -> ICMP policer
+ *     TCP with SYN (port-limited or all)    -> victim's SYN limit
+ *     UDP (port-limited or all)             -> victim's UDP limit
+ *     ICMP                                  -> victim's ICMP limit
  *
  * SYN Reset Challenge (RFC 793 §3.4 case 2, same mechanism as the kernel
  * mode's handle_syn_reset_challenge and the earlier synchallenge plugin it
@@ -55,10 +58,20 @@
  * the L4 fields), and port/flag checks need the first fragment (the masks
  * read whatever bytes sat at those offsets).
  *
- * Policing reuses the policer plugin's objects by index — the same
+ * Storm policing reuses the policer plugin's objects by index — the same
  * conform/exceed/violate accounting the classify path produced, so the
  * existing policer statistics keep working. Only transmit/drop actions are
  * used by virtserver; mark actions are not applied here.
+ *
+ * Victim flood limits are this plugin's own packet token buckets, one per
+ * (victim, flood type, worker), each worker refilling at its share of the
+ * limit (floodguard.c's floodguard_flood_share). A shared policer would
+ * let an attack on one victim drop another victim's traffic, and either
+ * be updated by every worker at once without a lock or need a handoff to
+ * one worker that would then carry the whole attack alone. The split
+ * assumes RSS spreads a victim's traffic evenly over the workers, which a
+ * spoofed-source flood does; a few heavy flows on one queue are limited
+ * at that queue's share.
  */
 
 #include <vlib/vlib.h>
@@ -124,6 +137,7 @@ static const char *const floodguard_kind_names[FLOODGUARD_N_KIND] = {
   [FLOODGUARD_KIND_UDP] = "udp",
   [FLOODGUARD_KIND_ICMP] = "icmp",
   [FLOODGUARD_KIND_SYN_CHALLENGE] = "syn-challenge",
+  [FLOODGUARD_KIND_IPV6] = "ipv6",
 };
 
 static const char *const floodguard_verdict_names[] = {
@@ -215,7 +229,7 @@ floodguard_l2_kind (const u8 *dst)
 
 static_always_inline uword
 floodguard_l2_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
-		      vlib_frame_t *frame, int is_nonip)
+		      vlib_frame_t *frame, int is_nonip, int is_ip6)
 {
   floodguard_main_t *fm = &floodguard_main;
   u32 *from = vlib_frame_vector_args (frame);
@@ -240,6 +254,18 @@ floodguard_l2_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	vlib_prefetch_buffer_header (b[2], LOAD);
 
       vnet_feature_next_u16 (next, b[0]);
+
+      if (is_ip6 && sw_if_index < vec_len (fm->ifs) &&
+	  fm->ifs[sw_if_index].ip6_drop)
+	{
+	  next[0] = FLOODGUARD_NEXT_DROP;
+	  b[0]->error = node->errors[FLOODGUARD_ERROR_DROP];
+	  drops[FLOODGUARD_KIND_IPV6]++;
+	  n_dropped++;
+	  floodguard_trace (vm, node, b[0], sw_if_index, ~0,
+			    FLOODGUARD_KIND_IPV6, FLOODGUARD_VERDICT_DROP);
+	  goto next_buffer;
+	}
 
       if (is_nonip && clib_mem_unaligned (eth + vnet_buffer (b[0])->l2.l2_len -
 					    2, u16) ==
@@ -267,6 +293,7 @@ floodguard_l2_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			drop ? FLOODGUARD_VERDICT_DROP :
 			       FLOODGUARD_VERDICT_PASS);
 
+    next_buffer:
       b++;
       next++;
       n_left--;
@@ -282,24 +309,59 @@ floodguard_l2_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 VLIB_NODE_FN (floodguard_l2_ip4_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return floodguard_l2_inline (vm, node, frame, 0);
+  return floodguard_l2_inline (vm, node, frame, 0, 0);
 }
 
 VLIB_NODE_FN (floodguard_l2_ip6_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return floodguard_l2_inline (vm, node, frame, 0);
+  return floodguard_l2_inline (vm, node, frame, 0, 1);
 }
 
 VLIB_NODE_FN (floodguard_l2_nonip_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
-  return floodguard_l2_inline (vm, node, frame, 1);
+  return floodguard_l2_inline (vm, node, frame, 1, 0);
 }
 
 /* ------------------------------------------------------------------------
  * Victim node
  * ------------------------------------------------------------------------ */
+
+/* floodguard_flood_allow: take one token from this worker's bucket for a
+ * victim; nonzero = within the limit. Same refill rule as the kernel
+ * mode's check_flood_limit: last_tick only advances by the time the
+ * tokens just added account for, so a flood arriving faster than one
+ * token per packet still refills at the configured rate. A division only
+ * when at least one token is due, at most rate times a second. */
+static_always_inline int
+floodguard_flood_allow (floodguard_bucket_t *bk, const floodguard_flood_t *f,
+			u64 now)
+{
+  u64 tpt = f->ticks_per_token;
+  u64 burst = f->burst_per_thread;
+  u64 elapsed = now - bk->last_tick;
+
+  if (elapsed >= f->fill_ticks)
+    {
+      bk->tokens = burst;
+      bk->last_tick = now;
+    }
+  else if (elapsed >= tpt)
+    {
+      u64 refill = elapsed / tpt;
+      bk->tokens += refill;
+      bk->last_tick += refill * tpt;
+    }
+  /* A smaller share since the last packet (more active workers, or a
+   * lower limit) caps what is left. */
+  if (bk->tokens > burst)
+    bk->tokens = burst;
+  if (!bk->tokens)
+    return 0;
+  bk->tokens--;
+  return 1;
+}
 
 #define FLOODGUARD_SIP_ROUND(v0, v1, v2, v3)                                  \
   do                                                                          \
@@ -517,9 +579,11 @@ VLIB_NODE_FN (floodguard_victim_node)
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   u32 drops[FLOODGUARD_N_KIND] = { 0 };
-  u32 n_dropped = 0;
+  u32 flood_counts[FLOODGUARD_N_FLOOD][FLOODGUARD_N_FLOOD_COUNTER] = { 0 };
+  u32 n_dropped = 0, n_flood = 0;
+  u32 thread = vm->thread_index;
   int check_victims = fm->n_victims != 0;
-  u64 now = clib_cpu_time_now () >> POLICER_TICKS_PER_PERIOD_SHIFT;
+  u64 now = clib_cpu_time_now ();
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -532,7 +596,6 @@ VLIB_NODE_FN (floodguard_victim_node)
       floodguard_kind_t kind = FLOODGUARD_KIND_NONE;
       floodguard_verdict_t verdict = FLOODGUARD_VERDICT_PASS;
       clib_bihash_kv_8_8_t kv, val;
-      u32 pi = ~0;
 
       if (n_left > 2)
 	vlib_prefetch_buffer_header (b[2], LOAD);
@@ -597,11 +660,36 @@ VLIB_NODE_FN (floodguard_victim_node)
 	  break;
 	}
 
+      u32 vi = FLOODGUARD_V_INDEX (v);
       if (kind >= FLOODGUARD_KIND_SYN && kind <= FLOODGUARD_KIND_ICMP)
 	{
-	  pi = fm->flood_policer[kind - FLOODGUARD_KIND_SYN];
-	  if (pi != ~0 && floodguard_police (vm, fm, b[0], pi, now))
-	    verdict = FLOODGUARD_VERDICT_DROP;
+	  u32 t = kind - FLOODGUARD_KIND_SYN;
+	  const floodguard_flood_t *f = &fm->flood[t];
+	  if (f->ticks_per_token)
+	    {
+	      floodguard_victim_thread_t *vt =
+		vec_elt_at_index (fm->victim_pool[vi].threads, thread);
+	      u32 c = floodguard_flood_allow (&vt->bucket[t], f, now) ?
+			FLOODGUARD_FLOOD_CONFORM :
+			FLOODGUARD_FLOOD_VIOLATE;
+	      if (c == FLOODGUARD_FLOOD_VIOLATE)
+		verdict = FLOODGUARD_VERDICT_DROP;
+	      vlib_increment_simple_counter (&fm->victim_counters[t][c],
+					     thread, vi, 1);
+	      flood_counts[t][c]++;
+	      n_flood++;
+	    }
+	}
+      else if (verdict == FLOODGUARD_VERDICT_PERMITTED ||
+	       verdict == FLOODGUARD_VERDICT_CHALLENGED)
+	{
+	  /* The challenge's per-victim activity, under the SYN limit's
+	   * counters (floodguard.h's victim_counters). */
+	  vlib_increment_simple_counter (
+	    &fm->victim_counters[0][verdict == FLOODGUARD_VERDICT_PERMITTED ?
+				      FLOODGUARD_FLOOD_CONFORM :
+				      FLOODGUARD_FLOOD_VIOLATE],
+	    thread, vi, 1);
 	}
 
       if (verdict == FLOODGUARD_VERDICT_DROP)
@@ -623,7 +711,7 @@ VLIB_NODE_FN (floodguard_victim_node)
 
     done:
       floodguard_trace (vm, node, b[0], vnet_buffer (b[0])->sw_if_index[VLIB_RX],
-			pi, kind, verdict);
+			~0, kind, verdict);
       b++;
       next++;
       n_left--;
@@ -631,6 +719,15 @@ VLIB_NODE_FN (floodguard_victim_node)
 
   if (n_dropped)
     floodguard_count_drops (vm, fm, drops);
+  if (n_flood)
+    {
+      int t, c;
+      for (t = 0; t < FLOODGUARD_N_FLOOD; t++)
+	for (c = 0; c < FLOODGUARD_N_FLOOD_COUNTER; c++)
+	  if (flood_counts[t][c])
+	    vlib_increment_simple_counter (&fm->flood_counters[t][c], thread,
+					   0, flood_counts[t][c]);
+    }
 
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
   return frame->n_vectors;
