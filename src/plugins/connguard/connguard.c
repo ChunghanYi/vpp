@@ -58,6 +58,18 @@ typedef struct
   u8 used;
 } connguard_dedup_t;
 
+/* connguard_agg_slots_for: the aggregation table size for n_conn conns[]
+ * slots — the smallest power of 2 of at least CONNGUARD_AGG_PER_CONN slots
+ * per connection slot. */
+static u32
+connguard_agg_slots_for (u32 n_conn)
+{
+  u32 n = 1;
+  while (n < n_conn * CONNGUARD_AGG_PER_CONN)
+    n <<= 1;
+  return n;
+}
+
 void
 connguard_ensure_init (void)
 {
@@ -90,29 +102,33 @@ connguard_ensure_init (void)
   vlib_validate_simple_counter (&cm->dropped_counters, 0);
   vlib_zero_simple_counter (&cm->dropped_counters, 0);
 
+  cm->n_conn_slots = CONNGUARD_CONN_SLOTS_DEFAULT;
+  cm->n_halfopen_slots = CONNGUARD_HALFOPEN_SLOTS_DEFAULT;
+  cm->n_agg_slots = connguard_agg_slots_for (cm->n_conn_slots);
+
   cm->rand_seed = (u32) clib_cpu_time_now ();
   cm->initialized = 1;
 }
 
 /* connguard_alloc_tables: the connection and half-open slots and the scan
- * tables, only once the feature is first enabled (~19MB + ~6MB + ~25MB of
- * main heap). */
+ * tables, only once the feature is first enabled (at the default sizes
+ * ~19MB + ~6MB + ~25MB of main heap). */
 static int
 connguard_alloc_tables (connguard_main_t *cm)
 {
   if (cm->conns)
     return 0;
   cm->conns = clib_mem_alloc_aligned_or_null (
-    (uword) CONNGUARD_CONN_SLOTS * sizeof (connguard_conn_t),
+    (uword) cm->n_conn_slots * sizeof (connguard_conn_t),
     CLIB_CACHE_LINE_BYTES);
   cm->agg = clib_mem_alloc_aligned_or_null (
-    (uword) CONNGUARD_AGG_SLOTS * sizeof (connguard_agg_t),
+    (uword) cm->n_agg_slots * sizeof (connguard_agg_t),
     CLIB_CACHE_LINE_BYTES);
   cm->dedup = clib_mem_alloc_aligned_or_null (
     (uword) CONNGUARD_DEDUP_SLOTS * sizeof (connguard_dedup_t),
     CLIB_CACHE_LINE_BYTES);
   cm->halfopen = clib_mem_alloc_aligned_or_null (
-    (uword) CONNGUARD_HALFOPEN_SLOTS * sizeof (connguard_halfopen_t),
+    (uword) cm->n_halfopen_slots * sizeof (connguard_halfopen_t),
     CLIB_CACHE_LINE_BYTES);
   if (!cm->conns || !cm->agg || !cm->dedup || !cm->halfopen)
     {
@@ -131,15 +147,71 @@ connguard_alloc_tables (connguard_main_t *cm)
       return -1;
     }
   clib_memset (cm->conns, 0,
-	       (uword) CONNGUARD_CONN_SLOTS * sizeof (connguard_conn_t));
+	       (uword) cm->n_conn_slots * sizeof (connguard_conn_t));
   clib_memset (cm->agg, 0,
-	       (uword) CONNGUARD_AGG_SLOTS * sizeof (connguard_agg_t));
+	       (uword) cm->n_agg_slots * sizeof (connguard_agg_t));
   clib_memset (cm->dedup, 0,
 	       (uword) CONNGUARD_DEDUP_SLOTS * sizeof (connguard_dedup_t));
   clib_memset (cm->halfopen, 0,
-	       (uword) CONNGUARD_HALFOPEN_SLOTS * sizeof (connguard_halfopen_t));
+	       (uword) cm->n_halfopen_slots * sizeof (connguard_halfopen_t));
   cm->agg_gen = 0;
   cm->prev_scan_ns = 0;
+  return 0;
+}
+
+/* connguard_resize_tables: new conns[]/halfopen[] slot counts (even). Not
+ * allocated yet: just the sizes connguard_alloc_tables will use.
+ * Allocated: the new tables replace the old ones, empty — called from the
+ * CLI, which runs with the worker threads stopped; tables_epoch makes a
+ * suspended scan stop. On failure nothing changes. */
+static int
+connguard_resize_tables (connguard_main_t *cm, u32 n_conn, u32 n_halfopen)
+{
+  u32 n_agg = connguard_agg_slots_for (n_conn);
+
+  if (n_conn == cm->n_conn_slots && n_halfopen == cm->n_halfopen_slots)
+    return 0;
+  if (!cm->conns)
+    {
+      cm->n_conn_slots = n_conn;
+      cm->n_halfopen_slots = n_halfopen;
+      cm->n_agg_slots = n_agg;
+      return 0;
+    }
+
+  connguard_conn_t *conns = clib_mem_alloc_aligned_or_null (
+    (uword) n_conn * sizeof (connguard_conn_t), CLIB_CACHE_LINE_BYTES);
+  connguard_halfopen_t *halfopen = clib_mem_alloc_aligned_or_null (
+    (uword) n_halfopen * sizeof (connguard_halfopen_t), CLIB_CACHE_LINE_BYTES);
+  connguard_agg_t *agg = clib_mem_alloc_aligned_or_null (
+    (uword) n_agg * sizeof (connguard_agg_t), CLIB_CACHE_LINE_BYTES);
+  if (!conns || !halfopen || !agg)
+    {
+      if (conns)
+	clib_mem_free (conns);
+      if (halfopen)
+	clib_mem_free (halfopen);
+      if (agg)
+	clib_mem_free (agg);
+      return -1;
+    }
+  clib_memset (conns, 0, (uword) n_conn * sizeof (connguard_conn_t));
+  clib_memset (halfopen, 0, (uword) n_halfopen * sizeof (connguard_halfopen_t));
+  clib_memset (agg, 0, (uword) n_agg * sizeof (connguard_agg_t));
+
+  clib_mem_free (cm->conns);
+  clib_mem_free (cm->halfopen);
+  clib_mem_free (cm->agg);
+  cm->conns = conns;
+  cm->halfopen = halfopen;
+  cm->agg = agg;
+  cm->n_conn_slots = n_conn;
+  cm->n_halfopen_slots = n_halfopen;
+  cm->n_agg_slots = n_agg;
+  cm->agg_gen = 0;
+  cm->prev_scan_ns = 0;
+  cm->tracked = 0;
+  cm->tables_epoch++;
   return 0;
 }
 
@@ -281,10 +353,10 @@ static connguard_agg_t *
 connguard_agg_get (connguard_agg_t *tbl, u32 gen, u32 client, u32 server,
 		   u16 port)
 {
-  u32 i = connguard_hash3 (client, server, port) & (CONNGUARD_AGG_SLOTS - 1);
+  u32 mask = connguard_main.n_agg_slots - 1;
+  u32 i = connguard_hash3 (client, server, port) & mask;
   u32 n;
-  for (n = 0; n < CONNGUARD_AGG_SLOTS;
-       n++, i = (i + 1) & (CONNGUARD_AGG_SLOTS - 1))
+  for (n = 0; n < connguard_main.n_agg_slots; n++, i = (i + 1) & mask)
     {
       connguard_agg_t *a = &tbl[i];
       if (a->gen != gen)
@@ -367,18 +439,19 @@ connguard_scan (vlib_main_t *vm, connguard_main_t *cm)
   u64 prev = cm->prev_scan_ns;
   u64 dt = prev ? now - prev : 0;
   f64 last_start = vlib_time_now (vm);
+  u32 epoch = cm->tables_epoch;
   u32 tracked = 0, i;
 
   clib_memcpy_fast (servers, cm->servers, sizeof (servers));
   if (++cm->agg_gen == 0)
     {
       clib_memset (agg, 0,
-		   (uword) CONNGUARD_AGG_SLOTS * sizeof (connguard_agg_t));
+		   (uword) cm->n_agg_slots * sizeof (connguard_agg_t));
       cm->agg_gen = 1;
     }
   u32 gen = cm->agg_gen;
 
-  for (i = 0; i < CONNGUARD_CONN_SLOTS; i++)
+  for (i = 0; i < cm->n_conn_slots; i++)
     {
       /* Time-budgeted: never hold the main thread for more than ~20us
        * at a time. */
@@ -389,7 +462,8 @@ connguard_scan (vlib_main_t *vm, connguard_main_t *cm)
 	    {
 	      vlib_process_suspend (vm, 100e-6);
 	      last_start = vlib_time_now (vm);
-	      if (!cm->enabled || !cm->conns)
+	      /* The tables may have been replaced meanwhile (CLI). */
+	      if (!cm->enabled || !cm->conns || cm->tables_epoch != epoch)
 		return;
 	    }
 	}
@@ -465,7 +539,7 @@ connguard_scan (vlib_main_t *vm, connguard_main_t *cm)
   for (i = 0; i < nservers; i++)
     snap[i].ip = servers[i];
 
-  for (i = 0; i < CONNGUARD_AGG_SLOTS; i++)
+  for (i = 0; i < cm->n_agg_slots; i++)
     {
       connguard_agg_t *a = &agg[i];
       u32 j;
@@ -556,8 +630,10 @@ VLIB_REGISTER_NODE (connguard_scan_process_node, static) = {
 
 /* connguard config enable <0|1> guard <0|1> mode <monitor|reset>
  *   req-timeout <s> req-min-rate <Bps> silent-timeout <s> read-timeout <s>
- *   max-conn <n> max-rate <n> — every keyword optional, unset ones keep
- *   their current value. */
+ *   max-conn <n> max-rate <n> conn-slots <n> halfopen-slots <n> — every
+ *   keyword optional, unset ones keep their current value. A new slot
+ *   count replaces that table with an empty one (connguard_resize_tables;
+ *   this CLI is not mp-safe, so the workers are stopped meanwhile). */
 static clib_error_t *
 connguard_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			     vlib_cli_command_t *cmd)
@@ -565,10 +641,13 @@ connguard_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
   connguard_main_t *cm = &connguard_main;
   connguard_settings_t s;
   u32 enabled, v;
+  u32 n_conn, n_halfopen;
 
   connguard_ensure_init ();
   s = cm->s;
   enabled = cm->enabled;
+  n_conn = cm->n_conn_slots;
+  n_halfopen = cm->n_halfopen_slots;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -592,6 +671,10 @@ connguard_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	s.max_conn = v;
       else if (unformat (input, "max-rate %u", &v))
 	s.max_rate = v;
+      else if (unformat (input, "conn-slots %u", &n_conn))
+	;
+      else if (unformat (input, "halfopen-slots %u", &n_halfopen))
+	;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
@@ -600,6 +683,13 @@ connguard_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (s.req_timeout_sec <= 0 || s.silent_timeout_sec <= 0 ||
       s.read_timeout_sec <= 0)
     return clib_error_return (0, "timeouts must be greater than 0");
+  if (n_conn < CONNGUARD_SLOTS_MIN || n_conn > CONNGUARD_SLOTS_MAX ||
+      n_halfopen < CONNGUARD_SLOTS_MIN || n_halfopen > CONNGUARD_SLOTS_MAX)
+    return clib_error_return (0, "conn-slots/halfopen-slots must be %u-%u",
+			      CONNGUARD_SLOTS_MIN, CONNGUARD_SLOTS_MAX);
+  /* Slots come in pairs. */
+  if (connguard_resize_tables (cm, n_conn & ~1u, n_halfopen & ~1u) != 0)
+    return clib_error_return (0, "connguard: out of memory for the tables");
   if (enabled && connguard_alloc_tables (cm) != 0)
     return clib_error_return (0, "connguard: out of memory for the tables");
 
@@ -610,9 +700,9 @@ connguard_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
       connguard_apply_features (cm);
       /* Features detached: no worker touches the slots any more. */
       clib_memset (cm->conns, 0,
-		   (uword) CONNGUARD_CONN_SLOTS * sizeof (connguard_conn_t));
+		   (uword) cm->n_conn_slots * sizeof (connguard_conn_t));
       clib_memset (cm->halfopen, 0,
-		   (uword) CONNGUARD_HALFOPEN_SLOTS *
+		   (uword) cm->n_halfopen_slots *
 		     sizeof (connguard_halfopen_t));
       cm->prev_scan_ns = 0;
       cm->n_snap = 0;
@@ -846,7 +936,7 @@ show_connguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	"\"dropped\":%llu,\"reset_total\":%llu,\"reset_failed\":%llu,"
 	"\"slow_request\":%llu,\"silent_hold\":%llu,\"slow_read\":%llu,"
 	"\"conn_limit\":%llu,\"conn_rate\":%llu,\"interval_ms\":%llu,"
-	"\"servers\":[",
+	"\"conn_slots\":%u,\"halfopen_slots\":%u,\"servers\":[",
 	cm->enabled ? 1 : 0, cm->s.guard_enabled ? 1 : 0,
 	cm->s.mode == CONNGUARD_MODE_RESET ? "reset" : "monitor", cm->tracked,
 	dropped, cm->reset_total, cm->reset_failed,
@@ -854,7 +944,8 @@ show_connguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	cm->detected[CONNGUARD_R_SILENT_HOLD],
 	cm->detected[CONNGUARD_R_SLOW_READ],
 	cm->detected[CONNGUARD_R_CONN_LIMIT],
-	cm->detected[CONNGUARD_R_CONN_RATE], cm->interval_ms);
+	cm->detected[CONNGUARD_R_CONN_RATE], cm->interval_ms,
+	cm->n_conn_slots, cm->n_halfopen_slots);
       for (i = 0; i < cm->n_servers; i++)
 	{
 	  u64 syn, synack, rst;
@@ -887,6 +978,8 @@ show_connguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		   cm->s.guard_enabled ? "enabled" : "disabled",
 		   cm->s.mode == CONNGUARD_MODE_RESET ? "reset" : "monitor");
   vlib_cli_output (vm, "  Tracked conns:     %u", cm->tracked);
+  vlib_cli_output (vm, "  Table slots:       conns %u, half-open %u",
+		   cm->n_conn_slots, cm->n_halfopen_slots);
   vlib_cli_output (vm, "  Resets sent:       %llu (failed %llu)",
 		   cm->reset_total, cm->reset_failed);
   vlib_cli_output (vm, "  Dropped (reset):   %llu", dropped);
@@ -919,7 +1012,7 @@ VLIB_CLI_COMMAND (connguard_config_command, static) = {
   .short_help = "connguard config [enable <0|1>] [guard <0|1>] "
 		"[mode <monitor|reset>] [req-timeout <s>] [req-min-rate <Bps>] "
 		"[silent-timeout <s>] [read-timeout <s>] [max-conn <n>] "
-		"[max-rate <n>]",
+		"[max-rate <n>] [conn-slots <n>] [halfopen-slots <n>]",
   .function = connguard_config_command_fn,
 };
 

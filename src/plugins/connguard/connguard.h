@@ -19,10 +19,17 @@
 /* Sizes — must match ebpf/xdp_bridge (APP_FILTER_*). */
 #define CONNGUARD_MAX_SERVERS 64
 #define CONNGUARD_MAX_PORTS   16   /* per server */
-#define CONNGUARD_CONN_SLOTS  262144 /* power of 2 */
-#define CONNGUARD_HALFOPEN_SLOTS 131072 /* power of 2 */
-
-#define CONNGUARD_AGG_SLOTS   (1u << 20) /* power of 2, >= 2 x CONNGUARD_CONN_SLOTS */
+/* conns[]/halfopen[] slot counts: defaults, and the range
+ * `connguard config conn-slots|halfopen-slots` accepts (virtserver sizes
+ * them from the link speed or the admin's value, like Kernel mode's
+ * tables — see virtserver/cmd/xdp_table_sizes.go). */
+#define CONNGUARD_CONN_SLOTS_DEFAULT     262144
+#define CONNGUARD_HALFOPEN_SLOTS_DEFAULT 131072
+#define CONNGUARD_SLOTS_MIN 1024
+#define CONNGUARD_SLOTS_MAX (16 * 1024 * 1024)
+/* The scan's aggregation table: a power of 2 of at least this many slots
+ * per conns[] slot. */
+#define CONNGUARD_AGG_PER_CONN 4
 #define CONNGUARD_DEDUP_SLOTS 8192
 #define CONNGUARD_DEDUP_NS      (10ULL * 1000000000ULL) /* per-source limit report hold */
 #define CONNGUARD_SYN_STALE_NS  (10ULL * 1000000000ULL) /* unanswered SYN stops counting */
@@ -177,15 +184,23 @@ typedef struct
   u32 servers[CONNGUARD_MAX_SERVERS];
   u32 n_servers;
 
-  /* conns: CONNGUARD_CONN_SLOTS slots, 2-way set associative (see
-   * node.c's connguard_slot_find), written by the worker threads without
-   * locks and read by the scan process. */
+  /* conns: n_conn_slots slots, 2-way set associative (see node.c's
+   * connguard_slot_find), written by the worker threads without locks and
+   * read by the scan process. */
   connguard_conn_t *conns;
 
-  /* halfopen: CONNGUARD_HALFOPEN_SLOTS slots, same 2-way design — client
-   * SYNs wait here until the handshake completes, so a spoofed-source SYN
+  /* halfopen: n_halfopen_slots slots, same 2-way design — client SYNs
+   * wait here until the handshake completes, so a spoofed-source SYN
    * flood never pushes tracked connections out of conns[]. */
   connguard_halfopen_t *halfopen;
+
+  /* Slot counts (even) and the aggregation table's (power of 2). Changed
+   * only by the CLI, with the workers stopped; tables_epoch counts those
+   * changes so a scan that suspended meanwhile stops. */
+  u32 n_conn_slots;
+  u32 n_halfopen_slots;
+  u32 n_agg_slots;
+  u32 tables_epoch;
 
   /* health[thread_index * CONNGUARD_MAX_SERVERS + server_idx] */
   connguard_health_t *health;
@@ -242,22 +257,33 @@ connguard_hash3 (u32 a, u32 b, u32 c)
   return (u32) (h ^ (h >> 29));
 }
 
+/* The even slot of a connection's pair (base, base+1) in a table of
+ * n_slots slots (even, >= 2) — the same hash and slot choice as
+ * kern/xdp_bridge.c's app_ho_base. */
 static_always_inline u32
-connguard_slot_base (u32 client_ip, u32 server_ip, u16 client_port,
-		     u16 server_port)
+connguard_pair_base (u32 n_slots, u32 client_ip, u32 server_ip,
+		     u16 client_port, u16 server_port)
 {
-  return connguard_hash3 (client_ip, server_ip,
-			  ((u32) client_port << 16) | server_port) &
-	 (CONNGUARD_CONN_SLOTS - 2); /* even slot; the pair is base, base+1 */
+  return (connguard_hash3 (client_ip, server_ip,
+			   ((u32) client_port << 16) | server_port) %
+	  (n_slots / 2)) *
+	 2;
 }
 
 static_always_inline u32
-connguard_halfopen_base (u32 client_ip, u32 server_ip, u16 client_port,
-			 u16 server_port)
+connguard_slot_base (connguard_main_t *cm, u32 client_ip, u32 server_ip,
+		     u16 client_port, u16 server_port)
 {
-  return connguard_hash3 (client_ip, server_ip,
-			  ((u32) client_port << 16) | server_port) &
-	 (CONNGUARD_HALFOPEN_SLOTS - 2);
+  return connguard_pair_base (cm->n_conn_slots, client_ip, server_ip,
+			      client_port, server_port);
+}
+
+static_always_inline u32
+connguard_halfopen_base (connguard_main_t *cm, u32 client_ip, u32 server_ip,
+			 u16 client_port, u16 server_port)
+{
+  return connguard_pair_base (cm->n_halfopen_slots, client_ip, server_ip,
+			      client_port, server_port);
 }
 
 #endif /* __included_connguard_h__ */

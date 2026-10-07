@@ -71,7 +71,7 @@ connguard_slot_match (connguard_conn_t *c, u32 cip, u32 sip, u16 cp, u16 sp)
 static_always_inline connguard_conn_t *
 connguard_slot_find (connguard_main_t *cm, u32 cip, u32 sip, u16 cp, u16 sp)
 {
-  u32 base = connguard_slot_base (cip, sip, cp, sp);
+  u32 base = connguard_slot_base (cm, cip, sip, cp, sp);
   connguard_conn_t *c0 = &cm->conns[base];
   connguard_conn_t *c1 = &cm->conns[base + 1];
 
@@ -110,7 +110,7 @@ static_always_inline connguard_conn_t *
 connguard_slot_claim (connguard_main_t *cm, u64 now, u32 cip, u32 sip, u16 cp,
 		      u16 sp)
 {
-  u32 base = connguard_slot_base (cip, sip, cp, sp);
+  u32 base = connguard_slot_base (cm, cip, sip, cp, sp);
   connguard_conn_t *c0 = &cm->conns[base];
   connguard_conn_t *c1 = &cm->conns[base + 1];
 
@@ -133,7 +133,7 @@ connguard_ho_match (connguard_halfopen_t *o, u32 cip, u32 sip, u16 cp, u16 sp)
 static_always_inline connguard_halfopen_t *
 connguard_ho_find (connguard_main_t *cm, u32 cip, u32 sip, u16 cp, u16 sp)
 {
-  u32 base = connguard_halfopen_base (cip, sip, cp, sp);
+  u32 base = connguard_halfopen_base (cm, cip, sip, cp, sp);
   connguard_halfopen_t *o0 = &cm->halfopen[base];
   connguard_halfopen_t *o1 = &cm->halfopen[base + 1];
 
@@ -150,7 +150,7 @@ static_always_inline connguard_halfopen_t *
 connguard_ho_claim (connguard_main_t *cm, u64 now, u32 cip, u32 sip, u16 cp,
 		    u16 sp)
 {
-  u32 base = connguard_halfopen_base (cip, sip, cp, sp);
+  u32 base = connguard_halfopen_base (cm, cip, sip, cp, sp);
   connguard_halfopen_t *o0 = &cm->halfopen[base];
   connguard_halfopen_t *o1 = &cm->halfopen[base + 1];
 
