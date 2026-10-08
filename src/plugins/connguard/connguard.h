@@ -30,6 +30,9 @@
 /* The scan's aggregation table: a power of 2 of at least this many slots
  * per conns[] slot. */
 #define CONNGUARD_AGG_PER_CONN 4
+/* Aggregation entries one connection can create: (source, service) and
+ * (source, server). */
+#define CONNGUARD_AGG_USED_PER_CONN 2
 #define CONNGUARD_DEDUP_SLOTS 8192
 #define CONNGUARD_DEDUP_NS      (10ULL * 1000000000ULL) /* per-source limit report hold */
 #define CONNGUARD_SYN_STALE_NS  (10ULL * 1000000000ULL) /* unanswered SYN stops counting */
@@ -80,10 +83,12 @@ enum
   CONNGUARD_A_REPORT,
 };
 
-/* One tracked connection. IPs in network byte order, ports and rcv_nxt in
- * host byte order. Field meanings are those of kern/xdp_bridge.c's struct
- * app_conn; server_sw_if_index is the LAN interface the server is behind
- * (where the client's packets are transmitted — and where a reset goes). */
+/* One tracked connection: exactly one cache line, so a slot pair is two
+ * aligned lines (the table is cache-line aligned and pairs start at even
+ * slots) — node.c prefetches both per packet. IPs in network byte order,
+ * ports and rcv_nxt in host byte order. Field meanings are those of
+ * kern/xdp_bridge.c's struct app_conn; what only a reset needs is kept
+ * apart in connguard_conn_cold_t. */
 typedef struct
 {
   u32 client_ip;
@@ -97,13 +102,25 @@ typedef struct
   u32 rcv_nxt;
   u32 wait_bytes;
   u32 wait_segs;
-  u32 server_sw_if_index;
+  u32 pad2;
   u64 start_ns;
   u64 wait_start_ns;
   u64 zero_win_ns;
+  u64 pad3;
+} connguard_conn_t;
+
+STATIC_ASSERT_SIZEOF (connguard_conn_t, CLIB_CACHE_LINE_BYTES);
+
+/* The rest of a conns[] slot, at the same index in conns_cold[]: written
+ * once when the connection is tracked, read only to send a reset.
+ * server_sw_if_index is the LAN interface the server is behind (where the
+ * client's packets are transmitted — and where a reset goes). */
+typedef struct
+{
+  u32 server_sw_if_index;
   u8 dst_mac[6];
   u8 src_mac[6];
-} connguard_conn_t;
+} connguard_conn_cold_t;
 
 /* A handshake in progress (client SYN seen) — see node.c's package doc
  * comment. Same 4-tuple form as connguard_conn_t. */
@@ -181,6 +198,12 @@ typedef struct
 
   /* {server_ip, port} -> server index. key = (server_ip << 32) | port. */
   clib_bihash_8_8_t svc_table;
+  /* svc_port_bitmap: bit p set = some protected server has port p — a
+   * superset of svc_table's ports, tested before it so a TCP packet whose
+   * service-side port no server protects (a LAN client's ephemeral port,
+   * an unprotected service) skips the bihash. Changed only by the
+   * `connguard service` CLI, with the workers stopped. */
+  u64 svc_port_bitmap[65536 / 64];
   u32 servers[CONNGUARD_MAX_SERVERS];
   u32 n_servers;
 
@@ -188,6 +211,7 @@ typedef struct
    * connguard_slot_find), written by the worker threads without locks and
    * read by the scan process. */
   connguard_conn_t *conns;
+  connguard_conn_cold_t *conns_cold;
 
   /* halfopen: n_halfopen_slots slots, same 2-way design — client SYNs
    * wait here until the handshake completes, so a spoofed-source SYN
@@ -208,6 +232,12 @@ typedef struct
 
   /* Scan-process state (main thread only). */
   void *agg;
+  /* agg_used: the agg slots this scan filled, in the order it filled
+   * them (n_agg_used of them) — the second pass walks only these instead
+   * of every slot. A connection fills at most 2 slots, so
+   * CONNGUARD_AGG_USED_PER_CONN per conns[] slot always suffices. */
+  u32 *agg_used;
+  u32 n_agg_used;
   void *dedup;
   u32 agg_gen;
   u64 prev_scan_ns;

@@ -967,6 +967,11 @@ VLIB_CLI_COMMAND (show_floodguard_command, static) = {
   .path = "show floodguard",
   .short_help = "show floodguard [victims]",
   .function = show_floodguard_command_fn,
+  /* virtserver polls this every few seconds: without a worker barrier.
+   * It still runs on the main thread, so the victims table, policer pool
+   * and counter vectors — changed only by the barrier-taking commands
+   * above — can't change underneath it; the rest are counters. */
+  .is_mp_safe = 1,
 };
 
 static clib_error_t *
