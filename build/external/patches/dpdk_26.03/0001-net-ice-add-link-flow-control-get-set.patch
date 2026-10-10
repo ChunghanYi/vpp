@@ -1,0 +1,145 @@
+diff -ru a/drivers/net/intel/ice/ice_ethdev.c b/drivers/net/intel/ice/ice_ethdev.c
+--- a/drivers/net/intel/ice/ice_ethdev.c	2026-10-10 15:08:16.083161673 +0900
++++ b/drivers/net/intel/ice/ice_ethdev.c	2026-10-10 15:08:40.330046093 +0900
+@@ -205,6 +205,8 @@
+ 						size_t *no_of_elements);
+ static int ice_get_dcb_info(struct rte_eth_dev *dev, struct rte_eth_dcb_info *dcb_info);
+ static int ice_priority_flow_ctrl_set(struct rte_eth_dev *dev, struct rte_eth_pfc_conf *pfc_conf);
++static int ice_flow_ctrl_get(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf);
++static int ice_flow_ctrl_set(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf);
+ 
+ static const struct rte_pci_id pci_id_ice_map[] = {
+ 	{ RTE_PCI_DEVICE(ICE_INTEL_VENDOR_ID, ICE_DEV_ID_E823L_BACKPLANE) },
+@@ -346,6 +348,8 @@
+ 	.buffer_split_supported_hdr_ptypes_get = ice_buffer_split_supported_hdr_ptypes_get,
+ 	.get_dcb_info                 =	ice_get_dcb_info,
+ 	.priority_flow_ctrl_set       = ice_priority_flow_ctrl_set,
++	.flow_ctrl_get                = ice_flow_ctrl_get,
++	.flow_ctrl_set                = ice_flow_ctrl_set,
+ };
+ 
+ /* store statistics names and its offset in stats structure */
+@@ -4888,6 +4892,16 @@
+ 	}
+ 
+ 	cfg.caps = phy_caps->caps | ICE_AQ_PHY_ENA_AUTO_LINK_UPDT;
++	if (((struct ice_adapter *)hw->back)->pf.fc_user_set) {
++		cfg.caps &= ~(ICE_AQC_PHY_EN_TX_LINK_PAUSE |
++			      ICE_AQC_PHY_EN_RX_LINK_PAUSE);
++		if (pi->fc.req_mode == ICE_FC_FULL ||
++		    pi->fc.req_mode == ICE_FC_TX_PAUSE)
++			cfg.caps |= ICE_AQC_PHY_EN_TX_LINK_PAUSE;
++		if (pi->fc.req_mode == ICE_FC_FULL ||
++		    pi->fc.req_mode == ICE_FC_RX_PAUSE)
++			cfg.caps |= ICE_AQC_PHY_EN_RX_LINK_PAUSE;
++	}
+ 	cfg.low_power_ctrl_an = phy_caps->low_power_ctrl_an;
+ 	cfg.eee_cap = phy_caps->eee_cap;
+ 	cfg.eeer_value = phy_caps->eeer_value;
+@@ -4904,6 +4918,91 @@
+ 	return err;
+ }
+ 
++/* Link flow control (802.3x PAUSE). The current mode is read from the PHY's
++ * active configuration; a requested mode is remembered in pf->fc_user_set /
++ * port_info->fc.req_mode so ice_phy_conf_link() keeps it across every
++ * dev_start/link-up (which otherwise reapplies the firmware default PAUSE
++ * bits), and is applied immediately via ice_set_fc() when the port is
++ * already started. Water marks / pause time are firmware-managed on ice
++ * and are ignored.
++ */
++static int
++ice_flow_ctrl_get(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf)
++{
++	struct ice_hw *hw = ICE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
++	struct ice_aqc_get_phy_caps_data *pcaps;
++	bool tx, rx;
++	int err;
++
++	pcaps = (struct ice_aqc_get_phy_caps_data *)
++		ice_malloc(hw, sizeof(*pcaps));
++	if (!pcaps)
++		return -ENOMEM;
++
++	err = ice_aq_get_phy_caps(hw->port_info, false,
++				  ICE_AQC_REPORT_ACTIVE_CFG, pcaps, NULL);
++	if (err) {
++		ice_free(hw, pcaps);
++		return -EIO;
++	}
++
++	tx = !!(pcaps->caps & ICE_AQC_PHY_EN_TX_LINK_PAUSE);
++	rx = !!(pcaps->caps & ICE_AQC_PHY_EN_RX_LINK_PAUSE);
++	ice_free(hw, pcaps);
++
++	memset(fc_conf, 0, sizeof(*fc_conf));
++	if (tx && rx)
++		fc_conf->mode = RTE_ETH_FC_FULL;
++	else if (rx)
++		fc_conf->mode = RTE_ETH_FC_RX_PAUSE;
++	else if (tx)
++		fc_conf->mode = RTE_ETH_FC_TX_PAUSE;
++	else
++		fc_conf->mode = RTE_ETH_FC_NONE;
++	fc_conf->autoneg = 1;
++	return 0;
++}
++
++static int
++ice_flow_ctrl_set(struct rte_eth_dev *dev, struct rte_eth_fc_conf *fc_conf)
++{
++	struct ice_hw *hw = ICE_DEV_PRIVATE_TO_HW(dev->data->dev_private);
++	struct ice_pf *pf = ICE_DEV_PRIVATE_TO_PF(dev->data->dev_private);
++	struct ice_port_info *pi = hw->port_info;
++	u8 aq_failures = 0;
++	int err;
++
++	switch (fc_conf->mode) {
++	case RTE_ETH_FC_NONE:
++		pi->fc.req_mode = ICE_FC_NONE;
++		break;
++	case RTE_ETH_FC_RX_PAUSE:
++		pi->fc.req_mode = ICE_FC_RX_PAUSE;
++		break;
++	case RTE_ETH_FC_TX_PAUSE:
++		pi->fc.req_mode = ICE_FC_TX_PAUSE;
++		break;
++	case RTE_ETH_FC_FULL:
++		pi->fc.req_mode = ICE_FC_FULL;
++		break;
++	default:
++		return -EINVAL;
++	}
++	pf->fc_user_set = true;
++
++	/* Not started yet: ice_phy_conf_link() applies it at dev_start. */
++	if (!dev->data->dev_started)
++		return 0;
++
++	err = ice_set_fc(pi, &aq_failures, true);
++	if (err) {
++		PMD_DRV_LOG(ERR, "Failed to set flow control (aq_failures %u)",
++			    aq_failures);
++		return -EIO;
++	}
++	return 0;
++}
++
+ static int
+ ice_dev_set_link_up(struct rte_eth_dev *dev)
+ {
+diff -ru a/drivers/net/intel/ice/ice_ethdev.h b/drivers/net/intel/ice/ice_ethdev.h
+--- a/drivers/net/intel/ice/ice_ethdev.h	2026-10-10 15:08:16.083161673 +0900
++++ b/drivers/net/intel/ice/ice_ethdev.h	2026-10-10 15:08:40.329046056 +0900
+@@ -609,6 +609,11 @@
+ 	 * and link status update during dev_start.
+ 	 */
+ 	rte_spinlock_t link_lock;
++	/* Link flow control (PAUSE) requested via flow_ctrl_set; when set,
++	 * ice_phy_conf_link() applies hw->port_info->fc.req_mode instead of the
++	 * firmware default PAUSE bits on every link (re)configuration.
++	 */
++	bool fc_user_set;
+ };
+ 
+ #define ICE_MAX_QUEUE_NUM  2048

@@ -219,6 +219,12 @@ typedef struct
    * deducted from device info */
   u8 driver_frame_overhead;
 
+  /* link flow control (802.3x PAUSE): requested state (0 = off, the
+   * default) and the result of the last rte_eth_dev_flow_ctrl_get/set,
+   * see dpdk_device_set_flow_ctrl () */
+  u8 flow_ctrl_on;
+  int flow_ctrl_rv;
+
   /* error string */
   clib_error_t *errors;
   dpdk_port_conf_t conf;
@@ -374,6 +380,7 @@ typedef struct
 void dpdk_device_setup (dpdk_device_t * xd);
 void dpdk_device_start (dpdk_device_t * xd);
 void dpdk_device_stop (dpdk_device_t * xd);
+int dpdk_device_set_flow_ctrl (dpdk_device_t *xd);
 int dpdk_port_state_callback (dpdk_portid_t port_id,
 			      enum rte_eth_event_type type,
 			      void *param, void *ret_param);

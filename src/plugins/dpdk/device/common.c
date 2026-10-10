@@ -467,8 +467,48 @@ dpdk_device_start (dpdk_device_t * xd)
 
   rte_eth_allmulticast_enable (xd->port_id);
 
+  dpdk_device_set_flow_ctrl (xd);
+
   dpdk_log_info ("Interface %U started", format_dpdk_device_name,
 		 xd->device_index);
+}
+
+/* Apply xd->flow_ctrl_on (full rx+tx PAUSE, or none) to the port. Called
+ * on every dpdk_device_start (), after rte_eth_dev_start (): some PMDs
+ * (igc, igb) re-initialize the hardware inside dev_start and reset flow
+ * control to their own default (full), so a setting applied before start
+ * would be lost. The current conf is read first and only the mode changed,
+ * because e.g. igc rejects a set whose autoneg/water marks differ from its
+ * own. Returns 0, or a negative errno (-ENOTSUP: PMD has no flow control
+ * support); the result is also kept in xd->flow_ctrl_rv for the show CLI. */
+int
+dpdk_device_set_flow_ctrl (dpdk_device_t *xd)
+{
+  struct rte_eth_fc_conf fc;
+  int rv;
+
+  if (xd->flags & DPDK_DEVICE_FLAG_PMD_INIT_FAIL)
+    return -ENODEV;
+
+  clib_memset (&fc, 0, sizeof (fc));
+  rv = rte_eth_dev_flow_ctrl_get (xd->port_id, &fc);
+  if (rv == 0)
+    {
+      fc.mode = xd->flow_ctrl_on ? RTE_ETH_FC_FULL : RTE_ETH_FC_NONE;
+      rv = rte_eth_dev_flow_ctrl_set (xd->port_id, &fc);
+    }
+  xd->flow_ctrl_rv = rv;
+
+  if (rv == -ENOTSUP)
+    dpdk_log_warn ("[%u] link flow control not supported by the driver",
+		   xd->port_id);
+  else if (rv)
+    dpdk_log_err ("[%u] link flow control %s failed: %d", xd->port_id,
+		  xd->flow_ctrl_on ? "on" : "off", rv);
+  else
+    dpdk_log_info ("[%u] link flow control %s", xd->port_id,
+		   xd->flow_ctrl_on ? "on" : "off");
+  return rv;
 }
 
 void

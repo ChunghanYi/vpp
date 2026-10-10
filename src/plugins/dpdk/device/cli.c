@@ -343,6 +343,146 @@ VLIB_CLI_COMMAND (cmd_set_dpdk_if_desc,static) = {
 };
 
 static clib_error_t *
+set_dpdk_if_flow_ctrl (vlib_main_t *vm, unformat_input_t *input,
+		       vlib_cli_command_t *cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  dpdk_main_t *dm = &dpdk_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_hw_interface_t *hw;
+  dpdk_device_t *xd;
+  u32 hw_if_index = (u32) ~0;
+  int on = -1;
+  int rv;
+  clib_error_t *error = NULL;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "%U", unformat_vnet_hw_interface, vnm,
+		    &hw_if_index))
+	;
+      else if (unformat (line_input, "on"))
+	on = 1;
+      else if (unformat (line_input, "off"))
+	on = 0;
+      else
+	{
+	  error = clib_error_return (0, "parse error: '%U'",
+				     format_unformat_error, line_input);
+	  goto done;
+	}
+    }
+
+  if (hw_if_index == (u32) ~0)
+    {
+      error = clib_error_return (0, "please specify valid interface name");
+      goto done;
+    }
+  if (on < 0)
+    {
+      error = clib_error_return (0, "please specify on or off");
+      goto done;
+    }
+
+  hw = vnet_get_hw_interface (vnm, hw_if_index);
+  if (hw->dev_class_index != dpdk_device_class.index)
+    {
+      error = clib_error_return (0, "not a DPDK interface");
+      goto done;
+    }
+  xd = vec_elt_at_index (dm->devices, hw->dev_instance);
+
+  /* Changing it renegotiates the link, so skip a no-op request. */
+  if (xd->flow_ctrl_on == on && xd->flow_ctrl_rv == 0)
+    goto done;
+
+  xd->flow_ctrl_on = on;
+
+  /* A stopped port gets it from dpdk_device_start (). */
+  if (!(xd->flags & DPDK_DEVICE_FLAG_ADMIN_UP))
+    goto done;
+
+  rv = dpdk_device_set_flow_ctrl (xd);
+  if (rv == -ENOTSUP)
+    error = clib_error_return (0, "flow control not supported by driver");
+  else if (rv)
+    error = clib_error_return (0, "flow control set failed: %d", rv);
+
+done:
+  unformat_free (line_input);
+  return error;
+}
+
+/*?
+ * Turn link flow control (802.3x PAUSE, rx and tx) on or off for a DPDK
+ * interface. Off is the default. The setting is applied again every time
+ * the port starts.
+ *
+ * @cliexpar
+ * @cliexcmd{set dpdk interface flow-control GigabitEthernet0/8/0 off}
+?*/
+VLIB_CLI_COMMAND (cmd_set_dpdk_if_flow_ctrl, static) = {
+  .path = "set dpdk interface flow-control",
+  .short_help = "set dpdk interface flow-control <interface> on|off",
+  .function = set_dpdk_if_flow_ctrl,
+};
+
+static clib_error_t *
+show_dpdk_if_flow_ctrl (vlib_main_t *vm, unformat_input_t *input,
+			vlib_cli_command_t *cmd)
+{
+  dpdk_main_t *dm = &dpdk_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  dpdk_device_t *xd;
+  struct rte_eth_fc_conf fc;
+  vnet_hw_interface_t *hw;
+  char *cur;
+  int rv;
+
+  vlib_cli_output (vm, "%-40s %-10s %s", "Interface", "Configured",
+		   "Current");
+  vec_foreach (xd, dm->devices)
+    {
+      if (xd->flags & DPDK_DEVICE_FLAG_PMD_INIT_FAIL)
+	continue;
+      hw = vnet_get_hw_interface (vnm, xd->hw_if_index);
+      clib_memset (&fc, 0, sizeof (fc));
+      rv = rte_eth_dev_flow_ctrl_get (xd->port_id, &fc);
+      if (rv == -ENOTSUP || xd->flow_ctrl_rv == -ENOTSUP)
+	cur = "not-supported";
+      else if (rv)
+	cur = "error";
+      else if (fc.mode == RTE_ETH_FC_FULL)
+	cur = "full";
+      else if (fc.mode == RTE_ETH_FC_RX_PAUSE)
+	cur = "rx";
+      else if (fc.mode == RTE_ETH_FC_TX_PAUSE)
+	cur = "tx";
+      else
+	cur = "none";
+      vlib_cli_output (vm, "%-40v %-10s %s", hw->name,
+		       xd->flow_ctrl_on ? "on" : "off", cur);
+    }
+  return 0;
+}
+
+/*?
+ * Show each DPDK interface's configured link flow control (on/off) and the
+ * mode the driver currently reports (full/rx/tx/none, or not-supported).
+ *
+ * @cliexpar
+ * @cliexcmd{show dpdk interface flow-control}
+?*/
+VLIB_CLI_COMMAND (cmd_show_dpdk_if_flow_ctrl, static) = {
+  .path = "show dpdk interface flow-control",
+  .short_help = "show dpdk interface flow-control",
+  .function = show_dpdk_if_flow_ctrl,
+};
+
+static clib_error_t *
 show_dpdk_version_command_fn (vlib_main_t * vm,
 			      unformat_input_t * input,
 			      vlib_cli_command_t * cmd)
