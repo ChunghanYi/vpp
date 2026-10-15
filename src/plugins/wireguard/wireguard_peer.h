@@ -138,6 +138,8 @@ void wg_peer_update_endpoint (index_t peeri, const ip46_address_t *addr,
 			      u16 port);
 void wg_peer_update_endpoint_from_mt (index_t peeri,
 				      const ip46_address_t *addr, u16 port);
+void wg_peer_update_src (index_t peeri, const ip46_address_t *addr);
+void wg_peer_update_src_from_mt (index_t peeri, const ip46_address_t *addr);
 
 static inline bool
 wg_peer_is_dead (wg_peer_t *peer)

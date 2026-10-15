@@ -431,6 +431,62 @@ wg_peer_update_endpoint_from_mt (index_t peeri, const ip46_address_t *addr,
 			     sizeof (args));
 }
 
+void
+wg_peer_update_src (index_t peeri, const ip46_address_t *addr)
+{
+  wg_peer_t *peer = wg_peer_get (peeri);
+
+  if (ip46_address_is_equal (&peer->src.addr, addr))
+    return;
+
+  wg_peer_endpoint_init (&peer->src, addr, peer->src.port);
+
+  u8 is_ip4 = ip46_address_is_ip4 (&peer->dst.addr);
+  vec_free (peer->rewrite);
+  peer->rewrite = wg_build_rewrite (&peer->src.addr, peer->src.port,
+				    &peer->dst.addr, peer->dst.port, is_ip4);
+
+  adj_index_t *adj_index;
+  vec_foreach (adj_index, peer->adj_indices)
+    {
+      if (adj_is_valid (*adj_index))
+	{
+	  adj_midchain_fixup_t fixup =
+	    wg_peer_get_fixup (peer, adj_get_link_type (*adj_index));
+	  adj_nbr_midchain_update_rewrite (*adj_index, fixup, NULL,
+					   ADJ_FLAG_MIDCHAIN_IP_STACK,
+					   vec_dup (peer->rewrite));
+
+	  wg_peer_adj_reset_stacking (*adj_index);
+	  wg_peer_adj_stack (peer, *adj_index);
+	}
+    }
+}
+
+typedef struct wg_peer_upd_src_args_t_
+{
+  index_t peeri;
+  ip46_address_t addr;
+} wg_peer_upd_src_args_t;
+
+static void
+wg_peer_update_src_thread_fn (wg_peer_upd_src_args_t *args)
+{
+  wg_peer_update_src (args->peeri, &args->addr);
+}
+
+void
+wg_peer_update_src_from_mt (index_t peeri, const ip46_address_t *addr)
+{
+  wg_peer_upd_src_args_t args = {
+    .peeri = peeri,
+  };
+
+  ip46_address_copy (&args.addr, addr);
+  vlib_rpc_call_main_thread (wg_peer_update_src_thread_fn, (u8 *) &args,
+			     sizeof (args));
+}
+
 int
 wg_peer_add (u32 tun_sw_if_index, const u8 preshared_key[NOISE_SYMMETRIC_KEY_LEN],
 	     bool preshared_key_set, const u8 public_key[NOISE_PUBLIC_KEY_LEN], u32 table_id,
