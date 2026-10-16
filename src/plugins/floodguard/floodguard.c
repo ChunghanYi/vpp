@@ -263,7 +263,16 @@ floodguard_wanted_arcs (floodguard_if_t *ifc)
   for (i = 0; i < FLOODGUARD_N_L2_KIND; i++)
     if (ifc->policer[i] != ~0)
       storm = 1;
-  if (ifc->enabled)
+  if (ifc->enabled && ifc->l3)
+    {
+      /* mighty_lb: a routed interface — storm and victim in one node on
+       * ip4-unicast, ARP on the arp arc (an L3 interface drops non-IP
+       * frames itself, and IPv6 while it has no IPv6 address). */
+      want |= FLOODGUARD_ARC_L3_IP4;
+      if (ifc->policer[FLOODGUARD_KIND_ARP - 1] != ~0)
+	want |= FLOODGUARD_ARC_L3_ARP;
+    }
+  else if (ifc->enabled)
     {
       want |= FLOODGUARD_ARC_VICTIM;
       if (storm)
@@ -285,12 +294,15 @@ floodguard_set_arcs (floodguard_if_t *ifc, u32 sw_if_index, u8 want)
     u8 bit;
     const char *arc;
     const char *node;
+    u8 is_l3;
   } arcs[] = {
     { FLOODGUARD_ARC_STORM_IP4, "l2-input-ip4", "floodguard-l2-ip4" },
     { FLOODGUARD_ARC_STORM_IP6, "l2-input-ip6", "floodguard-l2-ip6" },
     { FLOODGUARD_ARC_STORM_NONIP, "l2-input-nonip", "floodguard-l2-nonip" },
     { FLOODGUARD_ARC_VICTIM, "l2-input-ip4", "floodguard-victim" },
     { FLOODGUARD_ARC_WAN_REPLY, "l2-output-ip4", "floodguard-wan-reply" },
+    { FLOODGUARD_ARC_L3_IP4, "ip4-unicast", "floodguard-ip4", 1 },
+    { FLOODGUARD_ARC_L3_ARP, "arp", "floodguard-arp", 1 },
   };
   int i;
 
@@ -299,8 +311,12 @@ floodguard_set_arcs (floodguard_if_t *ifc, u32 sw_if_index, u8 want)
       int on = (want & arcs[i].bit) != 0;
       if (on == ((ifc->arcs & arcs[i].bit) != 0))
 	continue;
-      vnet_l2_feature_enable_disable (arcs[i].arc, arcs[i].node, sw_if_index,
-				      on, 0, 0);
+      if (arcs[i].is_l3)
+	vnet_feature_enable_disable (arcs[i].arc, arcs[i].node, sw_if_index,
+				     on, 0, 0);
+      else
+	vnet_l2_feature_enable_disable (arcs[i].arc, arcs[i].node, sw_if_index,
+					on, 0, 0);
     }
   ifc->arcs = want;
 }
@@ -312,7 +328,7 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
   floodguard_main_t *fm = &floodguard_main;
   vnet_main_t *vnm = vnet_get_main ();
   u32 sw_if_index = ~0, policer[FLOODGUARD_N_L2_KIND];
-  int enable = -1, ip6_drop = -1, wan_reply = -1, i;
+  int enable = -1, ip6_drop = -1, wan_reply = -1, l3 = 0, i;
   clib_error_t *error = 0;
   u8 *name = 0;
 
@@ -332,6 +348,8 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	wan_reply = 0;
       else if (unformat (input, "enable"))
 	enable = 1;
+      else if (unformat (input, "l3"))
+	l3 = 1;
       else if (unformat (input, "disable"))
 	enable = 0;
       else if (unformat (input, "%U", unformat_vnet_sw_interface, vnm,
@@ -381,6 +399,7 @@ floodguard_interface_command_fn (vlib_main_t *vm, unformat_input_t *input,
       /* enable replaces the whole storm/victim configuration; disable
        * clears it. */
       ifc->enabled = enable;
+      ifc->l3 = enable ? l3 : 0;
       for (i = 0; i < FLOODGUARD_N_L2_KIND; i++)
 	ifc->policer[i] = enable ? policer[i] : ~0;
     }
@@ -733,10 +752,10 @@ show_floodguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (!ifc->arcs)
 	continue;
       vlib_cli_output (vm,
-		       "    %U: %s, arp %U, broadcast %U, ctrl %U, multicast %U, "
+		       "    %U: %s%s, arp %U, broadcast %U, ctrl %U, multicast %U, "
 		       "ip6-drop %s, wan-reply %s",
 		       format_vnet_sw_if_index_name, vnm, sw_if_index,
-		       ifc->enabled ? "enabled" : "disabled",
+		       ifc->enabled ? "enabled" : "disabled", ifc->l3 ? " (l3)" : "",
 		       format_floodguard_policer, fm, ifc->policer[0],
 		       format_floodguard_policer, fm, ifc->policer[1],
 		       format_floodguard_policer, fm, ifc->policer[2],
@@ -925,7 +944,7 @@ VLIB_REGISTER_NODE (floodguard_challenge_sweep_node, static) = {
 
 VLIB_CLI_COMMAND (floodguard_interface_command, static) = {
   .path = "floodguard interface",
-  .short_help = "floodguard interface <interface> enable [arp <policer>] "
+  .short_help = "floodguard interface <interface> enable [l3] [arp <policer>] "
 		"[broadcast <policer>] [ctrl <policer>] [multicast <policer>] "
 		"| floodguard interface <interface> disable "
 		"| floodguard interface <interface> ip6-drop enable|disable "

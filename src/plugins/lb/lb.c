@@ -9,6 +9,8 @@
 #include <vnet/api_errno.h>
 #include <vnet/udp/udp_local.h>
 #include <vppinfra/lock.h>
+#include <vnet/dpo/load_balance.h>
+#include <vnet/adj/adj.h>
 
 //GC runs at most once every so many seconds
 #define LB_GARBAGE_RUN 60
@@ -83,6 +85,31 @@ const static char* const * const lb_dpo_nat6_port_nodes[DPO_PROTO_NUM] =
         [DPO_PROTO_IP6]  = lb_dpo_nat6_ip6_port,
     };
 
+/* mighty_lb: IPIP4 and L2 DSR (IPv4 VIPs only) */
+const static char * const lb_dpo_ipip4_ip4[] = { "lb4-ipip4" , NULL };
+const static char* const * const lb_dpo_ipip4_nodes[DPO_PROTO_NUM] =
+    {
+        [DPO_PROTO_IP4]  = lb_dpo_ipip4_ip4,
+    };
+
+const static char * const lb_dpo_ipip4_ip4_port[] = { "lb4-ipip4-port" , NULL };
+const static char* const * const lb_dpo_ipip4_port_nodes[DPO_PROTO_NUM] =
+    {
+        [DPO_PROTO_IP4]  = lb_dpo_ipip4_ip4_port,
+    };
+
+const static char * const lb_dpo_l2dsr_ip4[] = { "lb4-l2dsr" , NULL };
+const static char* const * const lb_dpo_l2dsr_nodes[DPO_PROTO_NUM] =
+    {
+        [DPO_PROTO_IP4]  = lb_dpo_l2dsr_ip4,
+    };
+
+const static char * const lb_dpo_l2dsr_ip4_port[] = { "lb4-l2dsr-port" , NULL };
+const static char* const * const lb_dpo_l2dsr_port_nodes[DPO_PROTO_NUM] =
+    {
+        [DPO_PROTO_IP4]  = lb_dpo_l2dsr_ip4_port,
+    };
+
 u32 lb_hash_time_now(vlib_main_t * vm)
 {
   return (u32) (vlib_time_now(vm) + 10000);
@@ -119,6 +146,8 @@ static char *lb_vip_type_strings[] = {
     [LB_VIP_TYPE_IP4_L3DSR] = "ip4-l3dsr",
     [LB_VIP_TYPE_IP4_NAT4] = "ip4-nat4",
     [LB_VIP_TYPE_IP6_NAT6] = "ip6-nat6",
+    [LB_VIP_TYPE_IP4_IPIP4] = "ip4-ipip4",
+    [LB_VIP_TYPE_IP4_L2DSR] = "ip4-l2dsr",
 };
 
 u8 *format_lb_vip_type (u8 * s, va_list * args)
@@ -177,8 +206,8 @@ u8 *format_lb_vip (u8 * s, va_list * args)
 u8 *format_lb_as (u8 * s, va_list * args)
 {
   lb_as_t *as = va_arg (*args, lb_as_t *);
-  return format(s, "%U %s", format_ip46_address,
-                &as->address, IP46_TYPE_ANY,
+  return format(s, "%U weight:%u %s", format_ip46_address,
+                &as->address, IP46_TYPE_ANY, as->weight,
                 (as->flags & LB_AS_FLAGS_USED)?"used":"removed");
 }
 
@@ -249,14 +278,21 @@ u8 *format_lb_vip_detailed (u8 * s, va_list * args)
   lb_as_t *as;
   u32 *as_index;
   pool_foreach (as_index, vip->as_indexes) {
+      vlib_counter_t c;
       as = &lbm->ass[*as_index];
-      s = format(s, "%U    %U %u buckets   %Lu flows  dpo:%u %s\n",
+      vlib_get_combined_counter (&lbm->as_counters, as - lbm->ass, &c);
+      s = format(s, "%U    %U weight:%u %u buckets   %Lu flows  dpo:%u mtu:%u %s\n"
+                    "%U      packets:%Lu bytes:%Lu new-flows:%Lu\n",
                    format_white_space, indent,
                    format_ip46_address, &as->address, IP46_TYPE_ANY,
+                   as->weight,
                    count[as - lbm->ass],
                    vlib_refcount_get(&lbm->as_refcount, as - lbm->ass),
-                   as->dpo.dpoi_index,
-                   (as->flags & LB_AS_FLAGS_USED)?"used":" removed");
+                   as->dpo.dpoi_index, as->mtu,
+                   (as->flags & LB_AS_FLAGS_USED)?"used":" removed",
+                   format_white_space, indent,
+                   c.packets, c.bytes,
+                   vlib_get_simple_counter (&lbm->as_new_flows, as - lbm->ass));
   }
 
   vec_free(count);
@@ -267,6 +303,8 @@ typedef struct {
   u32 as_index;
   u32 last;
   u32 skip;
+  u32 weight; /* mighty_lb */
+  u32 credit; /* mighty_lb */
 } lb_pseudorand_t;
 
 static int lb_pseudorand_compare(void *a, void *b)
@@ -420,6 +458,7 @@ out:
   vec_sort_with_function(sort_arr, lb_pseudorand_compare);
 
   //Now let's pseudo-randomly generate permutations
+  u32 wmax = 1;
   vec_foreach(pr, sort_arr) {
     lb_as_t *as = &lbm->ass[pr->as_index];
 
@@ -434,6 +473,10 @@ out:
      */
     pr->skip = ((seed & 0xffffffff) | 1) & vip->new_flow_table_mask;
     pr->last = (seed >> 32) & vip->new_flow_table_mask;
+    pr->weight = as->weight ? as->weight : 1;
+    pr->credit = 0;
+    if (pr->weight > wmax)
+      wmax = pr->weight;
   }
 
   //Let's create a new flow table
@@ -441,20 +484,30 @@ out:
   for (i=0; i<vec_len(new_flow_table); i++)
     new_flow_table[i].as_index = 0;
 
+  /*
+   * mighty_lb: weighted fill (same as ebpf/xdp_lb's lb_maglev_build) —
+   * a turn adds an AS's weight to its credit, and it claims a slot each
+   * time the credit reaches the largest weight, so the shares follow the
+   * weights; with equal weights it is one slot per turn, the plain table.
+   */
   u32 done = 0;
   while (1) {
     vec_foreach(pr, sort_arr) {
-      while (1) {
-        u32 last = pr->last;
-        pr->last = (pr->last + pr->skip) & vip->new_flow_table_mask;
-        if (new_flow_table[last].as_index == 0) {
-          new_flow_table[last].as_index = pr->as_index;
-          break;
+      pr->credit += pr->weight;
+      while (pr->credit >= wmax) {
+        pr->credit -= wmax;
+        while (1) {
+          u32 last = pr->last;
+          pr->last = (pr->last + pr->skip) & vip->new_flow_table_mask;
+          if (new_flow_table[last].as_index == 0) {
+            new_flow_table[last].as_index = pr->as_index;
+            break;
+          }
         }
+        done++;
+        if (done == vec_len(new_flow_table))
+          goto finished;
       }
-      done++;
-      if (done == vec_len(new_flow_table))
-        goto finished;
     }
   }
 
@@ -575,7 +628,8 @@ static int lb_as_find_index_vip(lb_vip_t *vip, ip46_address_t *address, u32 *as_
   return -1;
 }
 
-int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u32 n)
+int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u8 *weights,
+                   u32 n)
 {
   lb_main_t *lbm = &lb_main;
   lb_get_writer_lock();
@@ -586,6 +640,7 @@ int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u32 n)
   }
 
   ip46_type_t type = lb_encap_is_ip4(vip)?IP46_TYPE_IP4:IP46_TYPE_IP6;
+  u32 n_given = n;
   u32 *to_be_added = 0;
   u32 *to_be_updated = 0;
   u32 i;
@@ -596,6 +651,11 @@ int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u32 n)
   while (n--) {
 
     if (!lb_as_find_index_vip(vip, &addresses[n], &i)) {
+      if ((lbm->ass[i].flags & LB_AS_FLAGS_USED) && weights) {
+        /* mighty_lb: a weight change of an AS in use */
+        lbm->ass[i].weight = weights[n] ? weights[n] : 1;
+        goto next;
+      }
       if (lbm->ass[i].flags & LB_AS_FLAGS_USED) {
         vec_free(to_be_added);
         vec_free(to_be_updated);
@@ -627,9 +687,16 @@ next:
     continue;
   }
 
-  //Update reused ASs
+  //Update reused ASs (their index in addresses[] is lost here, so a
+  //re-added AS keeps its weight unless weights says otherwise below)
   vec_foreach(ip, to_be_updated) {
     lbm->ass[*ip].flags = LB_AS_FLAGS_USED;
+  }
+  if (weights) {
+    u32 k;
+    for (k = 0; k < n_given; k++)
+      if (!lb_as_find_index_vip(vip, &addresses[k], &i))
+        lbm->ass[i].weight = weights[k] ? weights[k] : 1;
   }
   vec_free(to_be_updated);
 
@@ -641,6 +708,12 @@ next:
     as->address = addresses[*ip];
     as->flags = LB_AS_FLAGS_USED;
     as->vip_index = vip_index;
+    as->weight = (weights && weights[*ip]) ? weights[*ip] : 1;
+    as->mtu = 0;
+    vlib_validate_combined_counter (&lbm->as_counters, as - lbm->ass);
+    vlib_zero_combined_counter (&lbm->as_counters, as - lbm->ass);
+    vlib_validate_simple_counter (&lbm->as_new_flows, as - lbm->ass);
+    vlib_zero_simple_counter (&lbm->as_new_flows, as - lbm->ass);
     pool_get(vip->as_indexes, as_index);
     *as_index = as - lbm->ass;
 
@@ -942,6 +1015,14 @@ static void lb_vip_add_adjacency(lb_main_t *lbm, lb_vip_t *vip,
     dpo_type = lbm->dpo_nat4_port_type;
   else if (lb_vip_is_nat6_port(vip))
     dpo_type = lbm->dpo_nat6_port_type;
+  else if (lb_vip_is_ipip4 (vip))
+    dpo_type = lbm->dpo_ipip4_type;
+  else if (lb_vip_is_ipip4_port (vip))
+    dpo_type = lbm->dpo_ipip4_port_type;
+  else if (lb_vip_is_l2dsr (vip))
+    dpo_type = lbm->dpo_l2dsr_type;
+  else if (lb_vip_is_l2dsr_port (vip))
+    dpo_type = lbm->dpo_l2dsr_port_type;
 
   dpo_set(&dpo, dpo_type, proto, *vip_prefix_index);
   fib_table_entry_special_dpo_add(0,
@@ -1017,7 +1098,9 @@ static void lb_vip_del_adjacency(lb_main_t *lbm, lb_vip_t *vip)
       if (!lb_vip_port_find_diff_port(&(vip->prefix), vip->plen,
                                       vip->protocol, vip->port, &vip_idx))
         {
-          lb_put_writer_lock();
+          /* mighty_lb: the caller (lb_vip_del) holds the writer lock and
+           * releases it itself — releasing it here too let lb_vip_del go
+           * on unlocked whenever another port of the VIP remained. */
           return;
         }
 
@@ -1306,12 +1389,34 @@ lb_as_stack (lb_as_t *as)
     dpo_type = lbm->dpo_nat4_port_type;
   else if (lb_vip_is_nat6_port(vip))
     dpo_type = lbm->dpo_nat6_port_type;
+  else if (lb_vip_is_ipip4 (vip))
+    dpo_type = lbm->dpo_ipip4_type;
+  else if (lb_vip_is_ipip4_port (vip))
+    dpo_type = lbm->dpo_ipip4_port_type;
+  else if (lb_vip_is_l2dsr (vip))
+    dpo_type = lbm->dpo_l2dsr_type;
+  else if (lb_vip_is_l2dsr_port (vip))
+    dpo_type = lbm->dpo_l2dsr_port_type;
 
+  const dpo_id_t *fwd =
+    fib_entry_contribute_ip_forwarding (as->next_hop_fib_entry_index);
   dpo_stack(dpo_type,
             lb_vip_is_ip4(vip->type)?DPO_PROTO_IP4:DPO_PROTO_IP6,
-            &as->dpo,
-            fib_entry_contribute_ip_forwarding(
-                as->next_hop_fib_entry_index));
+            &as->dpo, fwd);
+
+  /* mighty_lb: the path MTU toward the AS, for the GRE/IPIP encap's
+   * Fragmentation Needed check — the first bucket's adjacency (an AS is
+   * a host route: one path). Unknown (0) unless it is an adjacency. */
+  as->mtu = 0;
+  if (fwd->dpoi_type == DPO_LOAD_BALANCE)
+    {
+      const load_balance_t *lb0 = load_balance_get (fwd->dpoi_index);
+      const dpo_id_t *b0 = load_balance_get_bucket_i (lb0, 0);
+      if (b0->dpoi_type == DPO_ADJACENCY ||
+          b0->dpoi_type == DPO_ADJACENCY_INCOMPLETE ||
+          b0->dpoi_type == DPO_ADJACENCY_MIDCHAIN)
+        as->mtu = adj_get (b0->dpoi_index)->rewrite_header.max_l3_packet_bytes;
+    }
 }
 
 static fib_node_back_walk_rc_t
@@ -1320,6 +1425,43 @@ lb_fib_node_back_walk_notify (fib_node_t *node,
 {
     lb_as_stack(lb_as_from_fib_node(node));
     return (FIB_NODE_BACK_WALK_CONTINUE);
+}
+
+/* mighty_lb: VIP ICMP echo — the addresses lb4-vip-echo answers for, and
+ * the interfaces (the WAN) it runs on. */
+int
+lb_vip_echo_add_del (ip4_address_t *address, u8 is_add)
+{
+  lb_main_t *lbm = &lb_main;
+  clib_bihash_kv_8_8_t kv = { .key = address->as_u32, .value = 0 }, v;
+  int found = (clib_bihash_search_8_8 (&lbm->vip_echo, &kv, &v) == 0);
+
+  if (is_add)
+    {
+      if (found)
+        return 0;
+      clib_bihash_add_del_8_8 (&lbm->vip_echo, &kv, 1);
+      lbm->n_vip_echo++;
+      return 0;
+    }
+  if (!found)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+  clib_bihash_add_del_8_8 (&lbm->vip_echo, &kv, 0);
+  lbm->n_vip_echo--;
+  return 0;
+}
+
+int
+lb_vip_echo_enable_disable (u32 sw_if_index, u8 enable)
+{
+  /* idempotent: a vnet feature enabled twice runs twice */
+  static uword *enabled;
+  enable = enable != 0;
+  if (clib_bitmap_get (enabled, sw_if_index) == enable)
+    return 0;
+  enabled = clib_bitmap_set (enabled, sw_if_index, enable);
+  return vnet_feature_enable_disable ("ip4-unicast", "lb4-vip-echo",
+                                      sw_if_index, enable, 0, 0);
 }
 
 int lb_nat4_interface_add_del (u32 sw_if_index, int is_del)
@@ -1407,6 +1549,12 @@ lb_init (vlib_main_t * vm)
                                                   lb_dpo_nat4_port_nodes);
   lbm->dpo_nat6_port_type = dpo_register_new_type(&lb_vft,
                                                   lb_dpo_nat6_port_nodes);
+  lbm->dpo_ipip4_type = dpo_register_new_type(&lb_vft, lb_dpo_ipip4_nodes);
+  lbm->dpo_ipip4_port_type = dpo_register_new_type(&lb_vft,
+                                                   lb_dpo_ipip4_port_nodes);
+  lbm->dpo_l2dsr_type = dpo_register_new_type(&lb_vft, lb_dpo_l2dsr_nodes);
+  lbm->dpo_l2dsr_port_type = dpo_register_new_type(&lb_vft,
+                                                   lb_dpo_l2dsr_port_nodes);
   lbm->fib_node_type = fib_node_register_new_type ("lb", &lb_fib_node_vft);
 
   //Init AS reference counters
@@ -1418,6 +1566,14 @@ lb_init (vlib_main_t * vm)
   default_as->flags = 0;
   default_as->dpo.dpoi_next_node = LB_NEXT_DROP;
   default_as->vip_index = ~0;
+  default_as->weight = 1;
+  default_as->mtu = 0;
+  lbm->as_counters.name = "lb-as";
+  lbm->as_counters.stat_segment_name = "/lb/as";
+  lbm->as_new_flows.name = "lb-as-new-flows";
+  lbm->as_new_flows.stat_segment_name = "/lb/as-new-flows";
+  vlib_validate_combined_counter (&lbm->as_counters, 0);
+  vlib_validate_simple_counter (&lbm->as_new_flows, 0);
   default_as->address.ip6.as_u64[0] = 0xffffffffffffffffL;
   default_as->address.ip6.as_u64[1] = 0xffffffffffffffffL;
 
@@ -1441,6 +1597,10 @@ lb_init (vlib_main_t * vm)
   clib_bihash_init_24_8 (&lbm->mapping_by_as6,
                         "mapping_by_as6", LB_MAPPING_BUCKETS,
                         LB_MAPPING_MEMORY_SIZE);
+
+  clib_bihash_init_8_8 (&lbm->vip_echo, "lb vip echo", LB_VIP_ECHO_BUCKETS,
+                        LB_VIP_ECHO_MEMORY_SIZE);
+  lbm->n_vip_echo = 0;
 
 #define _(a,b,c) lbm->vip_counters[c].name = b;
   lb_foreach_vip_counter

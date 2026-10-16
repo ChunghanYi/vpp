@@ -7,11 +7,13 @@
 #include <vnet/fib/ip4_fib.h>
 
 #include <vnet/gre/packet.h>
+#include <vnet/ip/icmp4.h>
 #include <lb/lbhash.h>
 
 #define foreach_lb_error \
  _(NONE, "no error") \
- _(PROTO_NOT_SUPPORTED, "protocol not supported")
+ _(PROTO_NOT_SUPPORTED, "protocol not supported") \
+ _(FRAG_NEEDED, "fragmentation needed (DF, encap over path MTU)")
 
 typedef enum
 {
@@ -397,6 +399,49 @@ lb_node_fn (vlib_main_t * vm,
               vip_index0,
               1);
 
+          /* mighty_lb: per-AS counters */
+          if (PREDICT_TRUE (asindex0 != 0))
+            {
+              vlib_increment_combined_counter (&lbm->as_counters,
+                                               thread_index, asindex0, 1,
+                                               len0);
+              if (counter == LB_VIP_COUNTER_FIRST_PACKET)
+                vlib_increment_simple_counter (&lbm->as_new_flows,
+                                               thread_index, asindex0, 1);
+            }
+
+          /*
+           * mighty_lb: a DF packet the IPv4 GRE/IPIP encap would take over
+           * the AS path's MTU gets ICMP Fragmentation Needed (sent from
+           * the receiving interface's address by ip4-icmp-error) instead
+           * of a fragmented tunnel packet, so the client's PMTUD works —
+           * as in Kernel mode (ebpf/xdp_lb). A packet without DF is still
+           * encapsulated and fragmented by ip4-rewrite.
+           */
+          if (is_input_v4 && asindex0 != 0 &&
+              (encap_type == LB_ENCAP_TYPE_GRE4 ||
+               encap_type == LB_ENCAP_TYPE_IPIP4))
+            {
+              ip4_header_t *in0 = vlib_buffer_get_current (p0);
+              u16 mtu0 = lbm->ass[asindex0].mtu;
+              u16 overhead0 = sizeof (ip4_header_t) +
+                ((encap_type == LB_ENCAP_TYPE_GRE4) ? sizeof (gre_header_t) : 0);
+              if (PREDICT_FALSE (mtu0 > overhead0 && len0 + overhead0 > mtu0 &&
+                                 (in0->flags_and_fragment_offset &
+                                  clib_host_to_net_u16 (
+                                    IP4_HEADER_FLAG_DONT_FRAGMENT))))
+                {
+                  icmp4_error_set_vnet_buffer (
+                    p0, ICMP4_destination_unreachable,
+                    ICMP4_destination_unreachable_fragmentation_needed_and_dont_fragment_set,
+                    mtu0 - overhead0);
+                  vlib_node_increment_counter (vm, node->node_index,
+                                               LB_ERROR_FRAG_NEEDED, 1);
+                  next0 = LB_NEXT_ICMP_ERROR;
+                  goto lb_enqueue0;
+                }
+            }
+
           //Now let's encap
           if ((encap_type == LB_ENCAP_TYPE_GRE4)
               || (encap_type == LB_ENCAP_TYPE_GRE6))
@@ -405,10 +450,15 @@ lb_node_fn (vlib_main_t * vm,
               if (encap_type == LB_ENCAP_TYPE_GRE4) /* encap GRE4*/
                 {
                   ip4_header_t *ip40;
+                  /* mighty_lb: outer TOS = the inner one (was left as
+                   * whatever the headroom held) */
+                  u8 tos0 = is_input_v4 ?
+                    ((ip4_header_t *) vlib_buffer_get_current (p0))->tos : 0;
                   vlib_buffer_advance (
                       p0, -sizeof(ip4_header_t) - sizeof(gre_header_t));
                   ip40 = vlib_buffer_get_current (p0);
                   gre0 = (gre_header_t *) (ip40 + 1);
+                  ip40->tos = tos0;
                   ip40->src_address = lbm->ip4_src_address;
                   ip40->dst_address = lbm->ass[asindex0].address.ip4;
                   ip40->ip_version_and_header_length = 0x45;
@@ -443,6 +493,29 @@ lb_node_fn (vlib_main_t * vm,
                       clib_host_to_net_u16 (0x0800) :
                       clib_host_to_net_u16 (0x86DD);
             }
+          else if (encap_type == LB_ENCAP_TYPE_IPIP4) /* mighty_lb */
+            {
+              ip4_header_t *ip40;
+              u8 tos0 = ((ip4_header_t *) vlib_buffer_get_current (p0))->tos;
+              vlib_buffer_advance (p0, -sizeof (ip4_header_t));
+              ip40 = vlib_buffer_get_current (p0);
+              ip40->ip_version_and_header_length = 0x45;
+              ip40->tos = tos0;
+              ip40->length = clib_host_to_net_u16 (len0 + sizeof (ip4_header_t));
+              ip40->fragment_id = 0;
+              ip40->flags_and_fragment_offset = 0;
+              ip40->ttl = 128;
+              ip40->protocol = IP_PROTOCOL_IP_IN_IP;
+              ip40->src_address = lbm->ip4_src_address;
+              ip40->dst_address = lbm->ass[asindex0].address.ip4;
+              ip40->checksum = ip4_header_checksum (ip40);
+            }
+          else if (encap_type == LB_ENCAP_TYPE_L2DSR) /* mighty_lb */
+            {
+              /* Nothing to rewrite: the AS's adjacency (ip4-rewrite)
+               * gives the packet the AS's MAC and decrements the TTL, the
+               * destination stays the VIP the AS holds on lo. */
+            }
           else if (encap_type == LB_ENCAP_TYPE_L3DSR) /* encap L3DSR*/
             {
               ip4_header_t *ip40;
@@ -456,8 +529,10 @@ lb_node_fn (vlib_main_t * vm,
               ip40->dst_address.as_u32 = lbm->ass[asindex0].address.ip4.as_u32;
               /* Get and rewrite DSCP bit */
               old_tos = ip40->tos;
-              new_tos = (u8) ((vip0->encap_args.dscp & 0x3F) << 2);
-              ip40->tos = (u8) ((vip0->encap_args.dscp & 0x3F) << 2);
+              /* mighty_lb: keep the ECN bits */
+              new_tos = (u8) (((vip0->encap_args.dscp & 0x3F) << 2) |
+                              (old_tos & 0x3));
+              ip40->tos = new_tos;
 
               csum = ip40->checksum;
               csum = ip_csum_update (csum, old_tos, new_tos,
@@ -560,6 +635,7 @@ lb_node_fn (vlib_main_t * vm,
           vnet_buffer (p0)->ip.adj_index[VLIB_TX] =
               lbm->ass[asindex0].dpo.dpoi_index;
 
+        lb_enqueue0:
           if (PREDICT_FALSE(p0->flags & VLIB_BUFFER_IS_TRACED))
             {
               lb_trace_t *tr = vlib_add_trace (vm, node, p0, sizeof(*tr));
@@ -1025,6 +1101,35 @@ lb4_l3dsr_port_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
   return lb_node_fn (vm, node, frame, 1, LB_ENCAP_TYPE_L3DSR, 1);
 }
 
+/* mighty_lb */
+static uword
+lb4_ipip4_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
+                   vlib_frame_t * frame)
+{
+  return lb_node_fn (vm, node, frame, 1, LB_ENCAP_TYPE_IPIP4, 0);
+}
+
+static uword
+lb4_ipip4_port_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
+                        vlib_frame_t * frame)
+{
+  return lb_node_fn (vm, node, frame, 1, LB_ENCAP_TYPE_IPIP4, 1);
+}
+
+static uword
+lb4_l2dsr_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
+                   vlib_frame_t * frame)
+{
+  return lb_node_fn (vm, node, frame, 1, LB_ENCAP_TYPE_L2DSR, 0);
+}
+
+static uword
+lb4_l2dsr_port_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
+                        vlib_frame_t * frame)
+{
+  return lb_node_fn (vm, node, frame, 1, LB_ENCAP_TYPE_L2DSR, 1);
+}
+
 static uword
 lb6_nat6_port_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
                        vlib_frame_t * frame)
@@ -1063,7 +1168,8 @@ VLIB_REGISTER_NODE (lb6_gre6_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb6_gre4_node) =
@@ -1076,7 +1182,8 @@ VLIB_REGISTER_NODE (lb6_gre4_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_gre6_node) =
@@ -1089,7 +1196,8 @@ VLIB_REGISTER_NODE (lb4_gre6_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_gre4_node) =
@@ -1102,7 +1210,8 @@ VLIB_REGISTER_NODE (lb4_gre4_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb6_gre6_port_node) =
@@ -1115,7 +1224,8 @@ VLIB_REGISTER_NODE (lb6_gre6_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb6_gre4_port_node) =
@@ -1128,7 +1238,8 @@ VLIB_REGISTER_NODE (lb6_gre4_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_gre6_port_node) =
@@ -1141,7 +1252,8 @@ VLIB_REGISTER_NODE (lb4_gre6_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_gre4_port_node) =
@@ -1154,7 +1266,8 @@ VLIB_REGISTER_NODE (lb4_gre4_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_l3dsr_port_node) =
@@ -1167,7 +1280,8 @@ VLIB_REGISTER_NODE (lb4_l3dsr_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_l3dsr_node) =
@@ -1180,7 +1294,8 @@ VLIB_REGISTER_NODE (lb4_l3dsr_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb6_nat6_port_node) =
@@ -1193,7 +1308,8 @@ VLIB_REGISTER_NODE (lb6_nat6_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
 
 VLIB_REGISTER_NODE (lb4_nat4_port_node) =
@@ -1206,8 +1322,27 @@ VLIB_REGISTER_NODE (lb4_nat4_port_node) =
     .error_strings = lb_error_strings,
     .n_next_nodes = LB_N_NEXT,
     .next_nodes =
-        { [LB_NEXT_DROP] = "error-drop" },
+        { [LB_NEXT_DROP] = "error-drop",
+          [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },
   };
+
+/* mighty_lb */
+#define lb_mighty_encap_node(fn, nm)                                          \
+  VLIB_REGISTER_NODE (fn##_node) = {                                          \
+    .function = fn##_node_fn,                                                 \
+    .name = nm,                                                               \
+    .vector_size = sizeof (u32),                                              \
+    .format_trace = format_lb_trace,                                          \
+    .n_errors = LB_N_ERROR,                                                   \
+    .error_strings = lb_error_strings,                                        \
+    .n_next_nodes = LB_N_NEXT,                                                \
+    .next_nodes = { [LB_NEXT_DROP] = "error-drop",                            \
+                    [LB_NEXT_ICMP_ERROR] = "ip4-icmp-error" },                \
+  }
+lb_mighty_encap_node (lb4_ipip4, "lb4-ipip4");
+lb_mighty_encap_node (lb4_ipip4_port, "lb4-ipip4-port");
+lb_mighty_encap_node (lb4_l2dsr, "lb4-l2dsr");
+lb_mighty_encap_node (lb4_l2dsr_port, "lb4-l2dsr-port");
 
 static uword
 lb4_nodeport_node_fn (vlib_main_t * vm, vlib_node_runtime_t * node,
@@ -1300,3 +1435,128 @@ VLIB_REGISTER_NODE (lb_nat6_in2out_node) =
           [LB_NAT6_IN2OUT_NEXT_LOOKUP] = "ip6-lookup",
       },
   };
+
+/*
+ * mighty_lb: lb4-vip-echo — ip4-unicast feature of the WAN interface,
+ * after the input ACL: an ICMP echo request to a VIP in lbm->vip_echo is
+ * answered here (source = the VIP), since the VIP's FIB entry (lb or cnat)
+ * would otherwise take it to a load-balancing node that drops it. Every
+ * other packet goes on along the arc after a protocol test.
+ */
+typedef enum
+{
+  LB_VIP_ECHO_NEXT_LOOKUP,
+  LB_VIP_ECHO_N_NEXT,
+} lb_vip_echo_next_t;
+
+#define foreach_lb_vip_echo_error _ (REPLIED, "VIP echo replies sent")
+
+typedef enum
+{
+#define _(sym, str) LB_VIP_ECHO_ERROR_##sym,
+  foreach_lb_vip_echo_error
+#undef _
+    LB_VIP_ECHO_N_ERROR,
+} lb_vip_echo_error_t;
+
+static char *lb_vip_echo_error_strings[] = {
+#define _(sym, string) string,
+  foreach_lb_vip_echo_error
+#undef _
+};
+
+typedef struct
+{
+  ip4_address_t vip;
+  u32 replied;
+} lb_vip_echo_trace_t;
+
+static u8 *
+format_lb_vip_echo_trace (u8 *s, va_list *args)
+{
+  CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
+  CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
+  lb_vip_echo_trace_t *t = va_arg (*args, lb_vip_echo_trace_t *);
+  return format (s, "lb vip echo: dst %U %s", format_ip4_address, &t->vip,
+                 t->replied ? "replied" : "passed");
+}
+
+static uword
+lb4_vip_echo_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
+                      vlib_frame_t *frame)
+{
+  lb_main_t *lbm = &lb_main;
+  u32 n_left = frame->n_vectors, *from = vlib_frame_vector_args (frame);
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 n_replied = 0;
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+  while (n_left > 0)
+    {
+      ip4_header_t *ip0 = vlib_buffer_get_current (b[0]);
+      u32 next0;
+      u8 replied0 = 0;
+
+      vnet_feature_next (&next0, b[0]);
+      if (PREDICT_FALSE (ip0->protocol == IP_PROTOCOL_ICMP &&
+                         lbm->n_vip_echo != 0 && !ip4_is_fragment (ip0)))
+        {
+          icmp46_header_t *icmp0 = ip4_next_header (ip0);
+          clib_bihash_kv_8_8_t kv = { .key = ip0->dst_address.as_u32 }, v;
+          if (icmp0->type == ICMP4_echo_request &&
+              clib_bihash_search_8_8 (&lbm->vip_echo, &kv, &v) == 0)
+            {
+              ip4_address_t src0 = ip0->src_address;
+              ip_csum_t sum0 = icmp0->checksum;
+              sum0 = ip_csum_update (sum0, ICMP4_echo_request,
+                                     ICMP4_echo_reply, icmp46_header_t, type);
+              icmp0->type = ICMP4_echo_reply;
+              icmp0->checksum = ip_csum_fold (sum0);
+              ip0->src_address = ip0->dst_address;
+              ip0->dst_address = src0;
+              ip0->ttl = 64;
+              ip0->checksum = ip4_header_checksum (ip0);
+              /* the receiving interface's FIB */
+              vnet_buffer (b[0])->sw_if_index[VLIB_TX] = ~0;
+              next0 = LB_VIP_ECHO_NEXT_LOOKUP;
+              replied0 = 1;
+              n_replied++;
+            }
+        }
+      if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
+        {
+          lb_vip_echo_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
+          t->vip = replied0 ? ip0->src_address : ip0->dst_address;
+          t->replied = replied0;
+        }
+      next[0] = next0;
+      b++;
+      next++;
+      n_left--;
+    }
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  if (n_replied)
+    vlib_node_increment_counter (vm, node->node_index,
+                                 LB_VIP_ECHO_ERROR_REPLIED, n_replied);
+  return frame->n_vectors;
+}
+
+VLIB_REGISTER_NODE (lb4_vip_echo_node) = {
+  .function = lb4_vip_echo_node_fn,
+  .name = "lb4-vip-echo",
+  .vector_size = sizeof (u32),
+  .format_trace = format_lb_vip_echo_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = LB_VIP_ECHO_N_ERROR,
+  .error_strings = lb_vip_echo_error_strings,
+  .n_next_nodes = LB_VIP_ECHO_N_NEXT,
+  .next_nodes = { [LB_VIP_ECHO_NEXT_LOOKUP] = "ip4-lookup" },
+};
+
+VNET_FEATURE_INIT (lb4_vip_echo_feature, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "lb4-vip-echo",
+  .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa", "floodguard-ip4"),
+  .runs_before = VNET_FEATURES ("ip4-lookup"),
+};

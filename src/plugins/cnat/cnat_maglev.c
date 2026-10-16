@@ -21,7 +21,7 @@ static void
 cnat_maglev_shuffle (cnat_maglev_perm_t *permutation, u32 *buckets)
 {
   u32 N, M, i, done = 0;
-  u32 *next = 0;
+  u32 *next = 0, *credit = 0, wmax = 1;
 
   N = vec_len (permutation);
   if (N == 0)
@@ -34,26 +34,41 @@ cnat_maglev_shuffle (cnat_maglev_perm_t *permutation, u32 *buckets)
 
   vec_validate (next, N - 1);
   vec_zero (next);
+  vec_validate (credit, N - 1);
+  vec_zero (credit);
+  for (i = 0; i < N; i++)
+    if (permutation[i].weight > wmax)
+      wmax = permutation[i].weight;
 
+  /* mighty_lb: weighted fill (same as ebpf/xdp_lb's lb_maglev_build) — a
+   * turn adds a backend's weight to its credit and it claims a bucket each
+   * time the credit reaches the largest weight; equal weights give the
+   * plain Maglev table. */
   while (1)
     {
       for (i = 0; i < N; i++)
 	{
-	  u32 c = (permutation[i].offset + next[i] * permutation[i].skip) % M;
-	  while (buckets[c] != (u32) -1)
+	  credit[i] += permutation[i].weight;
+	  while (credit[i] >= wmax)
 	    {
+	      credit[i] -= wmax;
+	      u32 c = (permutation[i].offset + next[i] * permutation[i].skip) % M;
+	      while (buckets[c] != (u32) -1)
+		{
+		  next[i]++;
+		  c = (permutation[i].offset + next[i] * permutation[i].skip) % M;
+		}
+
+	      buckets[c] = permutation[i].index;
 	      next[i]++;
-	      c = (permutation[i].offset + next[i] * permutation[i].skip) % M;
-	    }
+	      done++;
 
-	  buckets[c] = permutation[i].index;
-	  next[i]++;
-	  done++;
-
-	  if (done == M)
-	    {
-	      vec_free (next);
-	      return;
+	      if (done == M)
+		{
+		  vec_free (next);
+		  vec_free (credit);
+		  return;
+		}
 	    }
 	}
     }
@@ -102,6 +117,7 @@ cnat_translation_init_maglev (cnat_translation_t *ct)
       permutation.offset = h1 % cm->maglev_len;
       permutation.skip = h2 % (cm->maglev_len - 1) + 1;
       permutation.index = backend_index++;
+      permutation.weight = trk->ct_weight ? trk->ct_weight : 1;
 
       if (trk->ct_flags & CNAT_TRK_FLAG_TEST_DISABLED)
 	continue;

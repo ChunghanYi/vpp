@@ -109,6 +109,7 @@ cnat_endpoint_tuple_decode (const vl_api_cnat_endpoint_tuple_t * in,
     return rv;
   rv = cnat_endpoint_decode (&in->dst_ep, &out->dst_ep);
   out->ep_flags = in->flags;
+  out->ep_weight = in->weight; /* mighty_lb */
   return rv;
 }
 
@@ -241,6 +242,7 @@ cnat_translation_send_details (u32 cti, void *args)
       cnat_endpoint_encode (&trk->ct_ep[VLIB_TX], &path->dst_ep);
       cnat_endpoint_encode (&trk->ct_ep[VLIB_RX], &path->src_ep);
       path->flags = trk->ct_flags;
+      path->weight = trk->ct_weight; /* mighty_lb */
       path++;
     }
 
@@ -466,6 +468,49 @@ vl_api_cnat_snat_policy_add_del_if_t_handler (
   BAD_SW_IF_INDEX_LABEL;
 
   REPLY_MACRO (VL_API_CNAT_SNAT_POLICY_ADD_DEL_IF_REPLY);
+}
+
+/* mighty_lb */
+static walk_rc_t
+cnat_path_stats_send_details (u32 cti, void *args)
+{
+  vl_api_cnat_path_stats_details_t *mp;
+  cnat_dump_walk_ctx_t *ctx = args;
+  cnat_translation_t *ct = cnat_translation_get (cti);
+  index_t *trk_index;
+
+  vec_foreach (trk_index, ct->ct_paths_indexes)
+    {
+      cnat_ep_trk_t *trk = &cnat_ep_trk_pool[*trk_index];
+      vlib_counter_t c;
+      vlib_get_combined_counter (&cnat_path_counters, *trk_index, &c);
+      mp = vl_msg_api_alloc_zero (sizeof (*mp));
+      mp->_vl_msg_id = ntohs (VL_API_CNAT_PATH_STATS_DETAILS + cnat_base_msg_id);
+      mp->context = ctx->context;
+      mp->translation_id = clib_host_to_net_u32 (cti);
+      cnat_endpoint_encode (&trk->ct_ep[VLIB_TX], &mp->dst_ep);
+      cnat_endpoint_encode (&trk->ct_ep[VLIB_RX], &mp->src_ep);
+      mp->weight = trk->ct_weight;
+      mp->flags = trk->ct_flags;
+      mp->packets = clib_host_to_net_u64 (c.packets);
+      mp->bytes = clib_host_to_net_u64 (c.bytes);
+      mp->new_flows = clib_host_to_net_u64 (vlib_get_simple_counter (&cnat_path_new_flows, *trk_index));
+      vl_api_send_msg (ctx->rp, (u8 *) mp);
+    }
+  return (WALK_CONTINUE);
+}
+
+static void
+vl_api_cnat_path_stats_dump_t_handler (vl_api_cnat_path_stats_dump_t *mp)
+{
+  vl_api_registration_t *rp = vl_api_client_index_to_registration (mp->client_index);
+  if (rp == 0)
+    return;
+  cnat_dump_walk_ctx_t ctx = {
+    .rp = rp,
+    .context = mp->context,
+  };
+  cnat_translation_walk (cnat_path_stats_send_details, &ctx);
 }
 
 #include <cnat/cnat.api.c>

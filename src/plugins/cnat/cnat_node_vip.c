@@ -27,6 +27,7 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
   cnat_ep_trk_t *trk0;
   u32 dpoi_index = -1;
   u8 do_snat = 0;
+  u8 probe_port = 0; /* mighty_lb */
   index_t cti;
   int rv;
 
@@ -80,7 +81,15 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
       /* We source NAT with the translation */
       do_snat = 1;
       ip46_address_copy (&rw->tuple.ip[VLIB_RX], &ip_addr_46 (&trk0->ct_ep[VLIB_RX].ce_ip));
-      if (ct->flags & CNAT_TR_FLAG_ALLOCATE_PORT)
+      /* mighty_lb: a TCP/UDP flow's source port is chosen with its return
+       * session below (cnat_rsession_create_snat_port — per SNAT address,
+       * lock-free) rather than from the bitmap allocator, so no port is
+       * marked allocated here; other protocols keep the original port. */
+      if ((ct->flags & CNAT_TR_FLAG_ALLOCATE_PORT) &&
+	  (iproto == IP_PROTOCOL_TCP || iproto == IP_PROTOCOL_UDP) &&
+	  !(ct->flags & CNAT_TR_FLAG_NO_RETURN_SESSION))
+	probe_port = 1;
+      else if (ct->flags & CNAT_TR_FLAG_ALLOCATE_PORT)
 	{
 	  rv = cspm->vip_policy (iproto, &rw->tuple.port[VLIB_RX]);
 	  if (CNAT_SOURCE_ERROR_USE_DEFAULT == rv)
@@ -98,18 +107,37 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
 	      rw->cts_dpoi_next_node = CNAT_NODE_VIP_NEXT_DROP;
 	      return (rw);
 	    }
+	  rw->cts_flags |= CNAT_TS_RW_FLAG_HAS_ALLOCATED_PORT;
 	}
-      rw->cts_flags |= CNAT_TS_RW_FLAG_HAS_ALLOCATED_PORT;
     }
 
   rw->cts_dpoi_next_node = ct->ct_lb.dpoi_next_node;
   rw->cts_lbi = dpoi_index;
+
+  /* mighty_lb: per path counters (new flow; packets counted by the node) */
+  vlib_increment_simple_counter (&cnat_path_new_flows, vm->thread_index, ts->ts_trk_index, 1);
 
   /* refcnt session in current client */
   cnat_client_cnt_session (cc);
   if (!(ct->flags & CNAT_TR_FLAG_NO_RETURN_SESSION))
     {
       cnat_timestamp_rewrite_t *rrw = NULL;
+
+      if (probe_port)
+	{
+	  u8 low = (trk0->ct_flags & CNAT_TRK_FLAG_SNAT_LOW_PORTS) != 0;
+	  if (cnat_rsession_create_snat_port (
+		rw, b->flow_id, CNAT_FIB_TABLE, 1 /* add client */,
+		low ? CNAT_SNAT_LOW_PORT_MIN : CNAT_SNAT_PORT_MIN,
+		low ? CNAT_SNAT_LOW_PORT_MAX : CNAT_SNAT_PORT_MAX))
+	    {
+	      vlib_node_registration_t *node =
+		(AF_IP4 == af) ? &cnat_vip_ip4_node : &cnat_vip_ip6_node;
+	      vlib_node_increment_counter (vm, node->index, CNAT_ERROR_EXHAUSTED_PORTS, 1);
+	      rw->cts_dpoi_next_node = CNAT_NODE_VIP_NEXT_DROP;
+	      return rw;
+	    }
+	}
 
       rrw = &ts->cts_rewrites[CNAT_LOCATION_FIB + CNAT_IS_RETURN];
       ts->ts_rw_bm |= 1 << (CNAT_LOCATION_FIB + CNAT_IS_RETURN);
@@ -121,9 +149,28 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
 
       cnat_make_buffer_5tuple (b, af, &rrw->tuple, 0 /* iph_offset */, 1 /* swap */);
 
+      if (!do_snat)
+	{
+	  /*
+	   * mighty_lb: DNAT only — the return (to the client's own address)
+	   * is translated by the cnat feature of the interface it arrives on
+	   * (the LAN, "set cnat feature"), so the same return rewrite also
+	   * goes to the INPUT location that feature applies, and the return
+	   * session gets no client: a client is a FIB /32 interposed on the
+	   * client's address plus a main-thread RPC per new address — one per
+	   * spoofed source of a SYN flood. The FIB location copy stays for
+	   * cnat_get_rsession_from_ts (session expiry).
+	   */
+	  cnat_timestamp_rewrite_t *irw =
+	    &ts->cts_rewrites[CNAT_LOCATION_INPUT + CNAT_IS_RETURN];
+	  *irw = *rrw;
+	  ts->ts_rw_bm |= 1 << (CNAT_LOCATION_INPUT + CNAT_IS_RETURN);
+	}
+
       clib_atomic_add_fetch (&ts->ts_session_refcnt, 1);
 
-      cnat_rsession_create (rw, b->flow_id, CNAT_FIB_TABLE, 1 /* add client */, 0, 0, 0);
+      if (!probe_port)
+	cnat_rsession_create (rw, b->flow_id, CNAT_FIB_TABLE, do_snat /* add client */, 0, 0, 0);
     }
 
   return rw;
@@ -158,6 +205,12 @@ cnat_vip_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b, 
     }
   else if (vnet_buffer2 (b)->session.state == CNAT_LOOKUP_IS_NEW)
     rw = cnat_vip_feature_new_flow_inline (vm, b, af, ts, cc);
+
+  /* mighty_lb: per path forward counters */
+  if (rw && vnet_buffer2 (b)->session.state != CNAT_LOOKUP_IS_RETURN &&
+      ts->ts_trk_index != CNAT_EP_TRK_INVALID_INDEX)
+    vlib_increment_combined_counter (&cnat_path_counters, vm->thread_index, ts->ts_trk_index, 1,
+				     vlib_buffer_length_in_chain (vm, b));
 
   cnat_translation (b, af, rw, &ts->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
   cnat_set_rw_next_node (b, rw, next0);
@@ -194,7 +247,9 @@ VLIB_REGISTER_NODE (cnat_vip_ip4_node) =
   .vector_size = sizeof (u32),
   .format_trace = format_cnat_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
-  .n_errors = 0,
+  /* mighty_lb: was 0 although new flows count EXHAUSTED_PORTS here */
+  .n_errors = CNAT_N_ERROR,
+  .error_strings = cnat_error_strings,
   .n_next_nodes = CNAT_NODE_VIP_N_NEXT,
   .next_nodes =
   {
@@ -209,7 +264,9 @@ VLIB_REGISTER_NODE (cnat_vip_ip6_node) =
   .vector_size = sizeof (u32),
   .format_trace = format_cnat_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
-  .n_errors = 0,
+  /* mighty_lb: was 0 although new flows count EXHAUSTED_PORTS here */
+  .n_errors = CNAT_N_ERROR,
+  .error_strings = cnat_error_strings,
   .n_next_nodes = CNAT_NODE_VIP_N_NEXT,
   .next_nodes =
   {

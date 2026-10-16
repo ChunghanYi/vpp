@@ -14,6 +14,8 @@
  * Counters for each translation
  */
 extern vlib_combined_counter_main_t cnat_translation_counters;
+extern vlib_combined_counter_main_t cnat_path_counters;  /* mighty_lb */
+extern vlib_simple_counter_main_t cnat_path_new_flows;   /* mighty_lb */
 
 typedef enum cnat_translation_flag_t_
 {

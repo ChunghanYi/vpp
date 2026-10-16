@@ -151,6 +151,7 @@ unformat_cnat_ep_tuple (unformat_input_t * input, va_list * args)
 {
   cnat_endpoint_tuple_t *a = va_arg (*args, cnat_endpoint_tuple_t *);
   int flgs = 0;
+  a->ep_weight = 1; /* mighty_lb */
   if (unformat (input, "%U->%U%U", unformat_cnat_ep, &a->src_ep,
 		unformat_cnat_ep, &a->dst_ep, unformat_cnat_ep_flags, &flgs))
     a->ep_flags = flgs;
@@ -343,9 +344,19 @@ cnat_config (vlib_main_t * vm, unformat_input_t * input)
   return 0;
 }
 
+/* mighty_lb: interfaces the cnat features are on — vnet features are not
+ * reference counted per node, so a second enable put every node on the
+ * arc twice (the return of a DNAT flow was then translated twice). */
+static uword *cnat_feature_enabled_if;
+
 int
 cnat_sw_interface_enable_disable (u32 sw_if_index, u8 enable)
 {
+  enable = enable != 0;
+  if (clib_bitmap_get (cnat_feature_enabled_if, sw_if_index) == enable)
+    return 0;
+  cnat_feature_enabled_if =
+    clib_bitmap_set (cnat_feature_enabled_if, sw_if_index, enable);
   cnat_lazy_init ();
   vnet_feature_enable_disable ("ip4-unicast", "cnat-input-ip4", sw_if_index, enable, 0, 0);
   vnet_feature_enable_disable ("ip4-unicast", "cnat-lookup-ip4", sw_if_index, enable, 0, 0);

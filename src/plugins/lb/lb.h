@@ -41,8 +41,15 @@
 #define LB_VIP_PER_PORT_BUCKETS  1024
 #define LB_VIP_PER_PORT_MEMORY_SIZE  64<<20
 
+/* mighty_lb: VIP ICMP echo address table (a few hundred VIPs at most) */
+#define LB_VIP_ECHO_BUCKETS      256
+#define LB_VIP_ECHO_MEMORY_SIZE  (1<<20)
+
 typedef enum {
   LB_NEXT_DROP,
+  /* mighty_lb: ICMP Fragmentation Needed for a DF packet the GRE/IPIP
+   * encap would take over the real server path's MTU. */
+  LB_NEXT_ICMP_ERROR,
   LB_N_NEXT,
 } lb_next_t;
 
@@ -125,6 +132,19 @@ typedef struct {
 #define LB_AS_FLAGS_USED 0x1
 
   /**
+   * mighty_lb: share of the VIP's new flows (1-255, plain Maglev when all
+   * are equal) — see lb_vip_update_new_flow_table.
+   */
+  u8 weight;
+
+  /**
+   * mighty_lb: L3 MTU of the path toward the AS (its adjacency's
+   * max_l3_packet_bytes, refreshed by lb_as_stack on every FIB change);
+   * 0 = unknown, no Fragmentation Needed check.
+   */
+  u16 mtu;
+
+  /**
    * Rotating timestamp of when LB_AS_FLAGS_USED flag was last set.
    *
    * AS removal is based on garbage collection and reference counting.
@@ -177,6 +197,12 @@ typedef enum {
   LB_ENCAP_TYPE_L3DSR,
   LB_ENCAP_TYPE_NAT4,
   LB_ENCAP_TYPE_NAT6,
+  /* mighty_lb: IPv4-in-IPv4 tunnel to the AS (tunl0 decap on it) */
+  LB_ENCAP_TYPE_IPIP4,
+  /* mighty_lb: L2 DSR — the packet is unchanged (dst stays the VIP) and
+   * leaves through the AS's adjacency, i.e. with its MAC; the AS must be
+   * on-link and hold the VIP on lo. */
+  LB_ENCAP_TYPE_L2DSR,
   LB_ENCAP_N_TYPES,
 } lb_encap_type_t;
 
@@ -203,6 +229,8 @@ typedef enum {
   LB_VIP_TYPE_IP4_L3DSR,
   LB_VIP_TYPE_IP4_NAT4,
   LB_VIP_TYPE_IP6_NAT6,
+  LB_VIP_TYPE_IP4_IPIP4, /* mighty_lb */
+  LB_VIP_TYPE_IP4_L2DSR, /* mighty_lb */
   LB_VIP_N_TYPES,
 } lb_vip_type_t;
 
@@ -326,7 +354,9 @@ typedef struct {
 #define lb_vip_is_ip4(type) (type == LB_VIP_TYPE_IP4_GRE6 \
                             || type == LB_VIP_TYPE_IP4_GRE4 \
                             || type == LB_VIP_TYPE_IP4_L3DSR \
-                            || type == LB_VIP_TYPE_IP4_NAT4 )
+                            || type == LB_VIP_TYPE_IP4_NAT4 \
+                            || type == LB_VIP_TYPE_IP4_IPIP4 \
+                            || type == LB_VIP_TYPE_IP4_L2DSR )
 
 #define lb_vip_is_ip6(type) (type == LB_VIP_TYPE_IP6_GRE6 \
                             || type == LB_VIP_TYPE_IP6_GRE4 \
@@ -335,7 +365,9 @@ typedef struct {
 #define lb_encap_is_ip4(vip) ((vip)->type == LB_VIP_TYPE_IP6_GRE4 \
                              || (vip)->type == LB_VIP_TYPE_IP4_GRE4 \
                              || (vip)->type == LB_VIP_TYPE_IP4_L3DSR \
-                             || (vip)->type == LB_VIP_TYPE_IP4_NAT4 )
+                             || (vip)->type == LB_VIP_TYPE_IP4_NAT4 \
+                             || (vip)->type == LB_VIP_TYPE_IP4_IPIP4 \
+                             || (vip)->type == LB_VIP_TYPE_IP4_L2DSR )
 
 #define lb_vip_is_src_ip_sticky(vip)                                          \
   (((vip)->flags & LB_VIP_FLAGS_SRC_IP_STICKY) != 0)
@@ -369,6 +401,31 @@ lb_vip_is_l3dsr_port(const lb_vip_t *vip)
 {
   return (vip->type == LB_VIP_TYPE_IP4_L3DSR && vip->port != 0);
 }
+/* mighty_lb */
+always_inline bool
+lb_vip_is_ipip4 (const lb_vip_t *vip)
+{
+  return (vip->type == LB_VIP_TYPE_IP4_IPIP4 && vip->port == 0);
+}
+
+always_inline bool
+lb_vip_is_ipip4_port (const lb_vip_t *vip)
+{
+  return (vip->type == LB_VIP_TYPE_IP4_IPIP4 && vip->port != 0);
+}
+
+always_inline bool
+lb_vip_is_l2dsr (const lb_vip_t *vip)
+{
+  return (vip->type == LB_VIP_TYPE_IP4_L2DSR && vip->port == 0);
+}
+
+always_inline bool
+lb_vip_is_l2dsr_port (const lb_vip_t *vip)
+{
+  return (vip->type == LB_VIP_TYPE_IP4_L2DSR && vip->port != 0);
+}
+
 always_inline bool
 lb_vip_is_nat4_port(const lb_vip_t *vip)
 {
@@ -527,6 +584,21 @@ typedef struct {
   vlib_simple_counter_main_t vip_counters[LB_N_VIP_COUNTERS];
 
   /**
+   * mighty_lb: per AS (lbm->ass index) — packets/bytes sent to it and
+   * the new flows given to it.
+   */
+  vlib_combined_counter_main_t as_counters;
+  vlib_simple_counter_main_t as_new_flows;
+
+  /**
+   * mighty_lb: VIP addresses (IPv4, host key = as_u32) the lb4-vip-echo
+   * feature answers ICMP echo requests for — lb and cnat VIPs alike,
+   * since their FIB entries take every packet to the VIP otherwise.
+   */
+  clib_bihash_8_8_t vip_echo;
+  u32 n_vip_echo;
+
+  /**
    * DPO used to send packet from IP4/6 lookup to LB node.
    */
   dpo_type_t dpo_gre4_type;
@@ -537,6 +609,10 @@ typedef struct {
   dpo_type_t dpo_l3dsr_port_type;
   dpo_type_t dpo_nat4_port_type;
   dpo_type_t dpo_nat6_port_type;
+  dpo_type_t dpo_ipip4_type;       /* mighty_lb */
+  dpo_type_t dpo_ipip4_port_type;  /* mighty_lb */
+  dpo_type_t dpo_l2dsr_type;       /* mighty_lb */
+  dpo_type_t dpo_l2dsr_port_type;  /* mighty_lb */
   /**
    * Node type for registering to fib changes.
    */
@@ -604,7 +680,11 @@ int lb_vip_find_index(ip46_address_t *prefix, u8 plen, u8 protocol,
 
 #define lb_vip_get_by_index(index) (pool_is_free_index(lb_main.vips, index)?NULL:pool_elt_at_index(lb_main.vips, index))
 
-int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u32 n);
+/* weights: one per address (1-255), or NULL for weight 1. With weights
+ * given, an AS that is already in use takes the new weight instead of
+ * failing with VALUE_EXIST (mighty_lb). */
+int lb_vip_add_ass(u32 vip_index, ip46_address_t *addresses, u8 *weights,
+                   u32 n);
 int lb_vip_del_ass(u32 vip_index, ip46_address_t *addresses, u32 n, u8 flush);
 int lb_flush_vip_as (u32 vip_index, u32 as_index);
 
@@ -613,6 +693,11 @@ u32 lb_hash_time_now(vlib_main_t * vm);
 void lb_garbage_collection();
 
 int lb_nat4_interface_add_del (u32 sw_if_index, int is_del);
+
+/* mighty_lb: VIP ICMP echo (lb4-vip-echo feature) */
+int lb_vip_echo_add_del (ip4_address_t *address, u8 is_add);
+int lb_vip_echo_enable_disable (u32 sw_if_index, u8 enable);
+extern vlib_node_registration_t lb4_vip_echo_node;
 int lb_nat6_interface_add_del (u32 sw_if_index, int is_del);
 
 format_function_t format_lb_main;

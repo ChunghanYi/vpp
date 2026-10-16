@@ -78,6 +78,10 @@ vl_api_lb_add_del_vip_t_handler
   } else {
     u32 vip_index;
     lb_vip_type_t type = 0;
+    /* mighty_lb: the enums are u32 in network byte order — compared raw,
+     * every encapsulation but GRE4 (0) became type 0 (ip6-gre6). */
+    mp->encap = ntohl (mp->encap);
+    mp->type = ntohl (mp->type);
 
     if (ip46_prefix_is_ip4(&(args.prefix), mp->pfx.len)) {
         if (mp->encap == LB_API_ENCAP_TYPE_GRE4)
@@ -88,6 +92,10 @@ vl_api_lb_add_del_vip_t_handler
             type = LB_VIP_TYPE_IP4_L3DSR;
         else if (mp->encap == LB_API_ENCAP_TYPE_NAT4)
             type = LB_VIP_TYPE_IP4_NAT4;
+        else if (mp->encap == LB_API_ENCAP_TYPE_IPIP4)
+            type = LB_VIP_TYPE_IP4_IPIP4;
+        else if (mp->encap == LB_API_ENCAP_TYPE_L2DSR)
+            type = LB_VIP_TYPE_IP4_L2DSR;
     } else {
         if (mp->encap == LB_API_ENCAP_TYPE_GRE4)
             type = LB_VIP_TYPE_IP6_GRE4;
@@ -144,6 +152,9 @@ vl_api_lb_add_del_vip_v2_t_handler (vl_api_lb_add_del_vip_v2_t *mp)
     {
       u32 vip_index;
       lb_vip_type_t type = 0;
+      /* mighty_lb: see vl_api_lb_add_del_vip_t_handler */
+      mp->encap = ntohl (mp->encap);
+      mp->type = ntohl (mp->type);
 
       if (ip46_prefix_is_ip4 (&(args.prefix), mp->pfx.len))
 	{
@@ -155,6 +166,10 @@ vl_api_lb_add_del_vip_v2_t_handler (vl_api_lb_add_del_vip_v2_t *mp)
 	    type = LB_VIP_TYPE_IP4_L3DSR;
 	  else if (mp->encap == LB_API_ENCAP_TYPE_NAT4)
 	    type = LB_VIP_TYPE_IP4_NAT4;
+	  else if (mp->encap == LB_API_ENCAP_TYPE_IPIP4)
+	    type = LB_VIP_TYPE_IP4_IPIP4;
+	  else if (mp->encap == LB_API_ENCAP_TYPE_L2DSR)
+	    type = LB_VIP_TYPE_IP4_L2DSR;
 	}
       else
 	{
@@ -217,7 +232,7 @@ vl_api_lb_add_del_as_t_handler
   if (mp->is_del)
     rv = lb_vip_del_ass(vip_index, &as_address, 1, mp->is_flush);
   else
-    rv = lb_vip_add_ass(vip_index, &as_address, 1);
+    rv = lb_vip_add_ass(vip_index, &as_address, 0, 1);
 
 done:
  REPLY_MACRO (VL_API_LB_ADD_DEL_AS_REPLY);
@@ -399,6 +414,161 @@ static void vl_api_lb_add_del_intf_nat6_t_handler
   BAD_SW_IF_INDEX_LABEL;
 
   REPLY_MACRO (VL_API_LB_ADD_DEL_INTF_NAT6_REPLY);
+}
+
+/*
+ * mighty_lb additions
+ */
+static void
+vl_api_lb_add_del_as_v2_t_handler (vl_api_lb_add_del_as_v2_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  vl_api_lb_add_del_as_v2_reply_t *rmp;
+  int rv = 0;
+  u32 vip_index;
+  ip46_address_t vip_ip_prefix;
+  ip46_address_t as_address;
+  u8 weight = mp->weight ? mp->weight : 1;
+
+  if (mp->port == 0)
+    mp->protocol = ~0;
+  ip_address_decode (&mp->pfx.address, &vip_ip_prefix);
+  ip_address_decode (&mp->as_address, &as_address);
+
+  if ((rv = lb_vip_find_index (&vip_ip_prefix, mp->pfx.len, mp->protocol,
+                               ntohs (mp->port), &vip_index)))
+    goto done;
+
+  if (mp->is_del)
+    rv = lb_vip_del_ass (vip_index, &as_address, 1, mp->is_flush);
+  else
+    rv = lb_vip_add_ass (vip_index, &as_address, &weight, 1);
+
+done:
+  REPLY_MACRO (VL_API_LB_ADD_DEL_AS_V2_REPLY);
+}
+
+static_always_inline u8
+lb_api_vip_plen (const lb_vip_t *vip)
+{
+  return lb_vip_is_ip4 (vip->type) ? vip->plen - 96 : vip->plen;
+}
+
+static void
+vl_api_lb_vip_v2_dump_t_handler (vl_api_lb_vip_v2_dump_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  vl_api_registration_t *reg;
+  vl_api_lb_vip_v2_details_t *rmp;
+  lb_vip_t *vip;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  pool_foreach (vip, lbm->vips)
+    {
+      u32 vi = vip - lbm->vips;
+      if (vi == 0 || !(vip->flags & LB_VIP_FLAGS_USED))
+        continue;
+      rmp = vl_msg_api_alloc (sizeof (*rmp));
+      clib_memset (rmp, 0, sizeof (*rmp));
+      rmp->_vl_msg_id = htons (VL_API_LB_VIP_V2_DETAILS + lbm->msg_id_base);
+      rmp->context = mp->context;
+      ip_address_encode (&vip->prefix, IP46_TYPE_ANY, &rmp->vip);
+      rmp->vip_plen = lb_api_vip_plen (vip);
+      rmp->protocol = vip->port ? vip->protocol : 0;
+      rmp->port = htons (vip->port);
+      rmp->type = htonl (vip->type);
+      rmp->dscp = (vip->type == LB_VIP_TYPE_IP4_L3DSR) ? vip->encap_args.dscp : 0;
+      rmp->src_ip_sticky = lb_vip_is_src_ip_sticky (vip);
+      rmp->flow_table_length = htonl (vip->new_flow_table_mask + 1);
+      rmp->next_packets = clib_host_to_net_u64 (vlib_get_simple_counter (
+        &lbm->vip_counters[LB_VIP_COUNTER_NEXT_PACKET], vi));
+      rmp->first_packets = clib_host_to_net_u64 (vlib_get_simple_counter (
+        &lbm->vip_counters[LB_VIP_COUNTER_FIRST_PACKET], vi));
+      rmp->untracked_packets = clib_host_to_net_u64 (vlib_get_simple_counter (
+        &lbm->vip_counters[LB_VIP_COUNTER_UNTRACKED_PACKET], vi));
+      rmp->no_server_packets = clib_host_to_net_u64 (vlib_get_simple_counter (
+        &lbm->vip_counters[LB_VIP_COUNTER_NO_SERVER], vi));
+      vl_api_send_msg (reg, (u8 *) rmp);
+    }
+}
+
+static void
+vl_api_lb_as_v2_dump_t_handler (vl_api_lb_as_v2_dump_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  vl_api_registration_t *reg;
+  vl_api_lb_as_v2_details_t *rmp;
+  lb_vip_t *vip;
+  u32 *as_index;
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  pool_foreach (vip, lbm->vips)
+    {
+      if (vip == lbm->vips || !(vip->flags & LB_VIP_FLAGS_USED))
+        continue;
+      pool_foreach (as_index, vip->as_indexes)
+        {
+          lb_as_t *as;
+          vlib_counter_t c;
+          if (*as_index == 0)
+            continue;
+          as = &lbm->ass[*as_index];
+          vlib_get_combined_counter (&lbm->as_counters, *as_index, &c);
+          rmp = vl_msg_api_alloc (sizeof (*rmp));
+          clib_memset (rmp, 0, sizeof (*rmp));
+          rmp->_vl_msg_id = htons (VL_API_LB_AS_V2_DETAILS + lbm->msg_id_base);
+          rmp->context = mp->context;
+          ip_address_encode (&vip->prefix, IP46_TYPE_ANY, &rmp->vip);
+          rmp->vip_plen = lb_api_vip_plen (vip);
+          rmp->protocol = vip->port ? vip->protocol : 0;
+          rmp->port = htons (vip->port);
+          ip_address_encode (&as->address, IP46_TYPE_ANY, &rmp->as_address);
+          rmp->weight = as->weight;
+          rmp->flags = as->flags;
+          rmp->mtu = htons (as->mtu);
+          rmp->in_use_since = htonl (as->last_used);
+          rmp->active_flows =
+            htonl ((u32) vlib_refcount_get (&lbm->as_refcount, *as_index));
+          rmp->packets = clib_host_to_net_u64 (c.packets);
+          rmp->bytes = clib_host_to_net_u64 (c.bytes);
+          rmp->new_flows = clib_host_to_net_u64 (
+            vlib_get_simple_counter (&lbm->as_new_flows, *as_index));
+          vl_api_send_msg (reg, (u8 *) rmp);
+        }
+    }
+}
+
+static void
+vl_api_lb_vip_echo_add_del_t_handler (vl_api_lb_vip_echo_add_del_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  vl_api_lb_vip_echo_add_del_reply_t *rmp;
+  ip4_address_t addr;
+  int rv;
+
+  ip4_address_decode (mp->address, &addr);
+  rv = lb_vip_echo_add_del (&addr, mp->is_add);
+  REPLY_MACRO (VL_API_LB_VIP_ECHO_ADD_DEL_REPLY);
+}
+
+static void
+vl_api_lb_vip_echo_enable_disable_t_handler (
+  vl_api_lb_vip_echo_enable_disable_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  vl_api_lb_vip_echo_enable_disable_reply_t *rmp;
+  int rv = 0;
+
+  VALIDATE_SW_IF_INDEX (mp);
+  rv = lb_vip_echo_enable_disable (ntohl (mp->sw_if_index), mp->enable);
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_LB_VIP_ECHO_ENABLE_DISABLE_REPLY);
 }
 
 #include <lb/lb.api.c>

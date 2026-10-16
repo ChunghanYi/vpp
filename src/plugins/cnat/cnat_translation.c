@@ -28,6 +28,17 @@ vlib_combined_counter_main_t cnat_translation_counters = {
   .stat_segment_name = "/net/cnat-translation",
 };
 
+/* mighty_lb: per path (cnat_ep_trk_pool index) — packets/bytes of the
+ * forward direction sent to it and the new flows given to it */
+vlib_combined_counter_main_t cnat_path_counters = {
+  .name = "cnat-path",
+  .stat_segment_name = "/net/cnat-path",
+};
+vlib_simple_counter_main_t cnat_path_new_flows = {
+  .name = "cnat-path-new-flows",
+  .stat_segment_name = "/net/cnat-path-new-flows",
+};
+
 void
 cnat_translation_watch_addr (index_t cti, u64 opaque, cnat_endpoint_t * ep,
 			     cnat_addr_resol_type_t type)
@@ -213,7 +224,9 @@ cnat_translation_stack (cnat_translation_t * ct)
   vec_foreach (trk_index, ct->ct_paths_indexes)
     {
       trk = &cnat_ep_trk_pool[*trk_index];
-      if (trk->ct_flags & CNAT_TRK_ACTIVE)
+      /* mighty_lb: a draining path (weight 0) keeps its sessions but
+       * takes no new flows */
+      if ((trk->ct_flags & CNAT_TRK_ACTIVE) && trk->ct_weight)
 	vec_add1 (ct->ct_active_paths_indexes, *trk_index);
     }
   flow_hash_config_t fhc = IP_FLOW_HASH_DEFAULT;
@@ -365,7 +378,12 @@ cnat_translation_update (cnat_endpoint_t *vip, ip_protocol_t proto,
 
       if (new_paths_indexes[i] != INDEX_INVALID)
 	{
-	  /* unchanged backend: slot already has the trk_index */
+	  /* unchanged backend: slot already has the trk_index —
+	   * mighty_lb: its weight and port flag may have changed */
+	  cnat_ep_trk_t *otrk = &cnat_ep_trk_pool[new_paths_indexes[i]];
+	  otrk->ct_weight = path->ep_weight;
+	  otrk->ct_flags = (otrk->ct_flags & ~CNAT_TRK_FLAG_SNAT_LOW_PORTS) |
+			   (path->ep_flags & CNAT_TRK_FLAG_SNAT_LOW_PORTS);
 	  vec_add1 (ct->ct_paths_indexes, new_paths_indexes[i]);
 	  continue;
 	}
@@ -373,9 +391,15 @@ cnat_translation_update (cnat_endpoint_t *vip, ip_protocol_t proto,
       /* new backend: allocate and track */
       cnat_ep_trk_t *trk;
       pool_get_zero (cnat_ep_trk_pool, trk);
+      /* mighty_lb: per path counters */
+      vlib_validate_combined_counter (&cnat_path_counters, trk - cnat_ep_trk_pool);
+      vlib_zero_combined_counter (&cnat_path_counters, trk - cnat_ep_trk_pool);
+      vlib_validate_simple_counter (&cnat_path_new_flows, trk - cnat_ep_trk_pool);
+      vlib_zero_simple_counter (&cnat_path_new_flows, trk - cnat_ep_trk_pool);
       clib_memcpy (&trk->ct_ep[VLIB_TX], &path->dst_ep, sizeof (trk->ct_ep[VLIB_TX]));
       clib_memcpy (&trk->ct_ep[VLIB_RX], &path->src_ep, sizeof (trk->ct_ep[VLIB_RX]));
       trk->ct_flags = path->ep_flags;
+      trk->ct_weight = path->ep_weight; /* mighty_lb */
       trk->ct_dpo = tmp;
 
       vec_add1 (ct->ct_paths_indexes, trk - cnat_ep_trk_pool);
@@ -405,8 +429,16 @@ format_cnat_ep_trk (u8 * s, va_list * args)
   cnat_ep_trk_t *ck = va_arg (*args, cnat_ep_trk_t *);
   u32 indent = va_arg (*args, u32);
 
+  vlib_counter_t c;
   s = format (s, "%U->%U", format_cnat_endpoint, &ck->ct_ep[VLIB_RX],
 	      format_cnat_endpoint, &ck->ct_ep[VLIB_TX]);
+  /* mighty_lb */
+  vlib_get_combined_counter (&cnat_path_counters, ck - cnat_ep_trk_pool, &c);
+  s = format (s, " weight:%u%s%s pkts:%Lu bytes:%Lu new-flows:%Lu", ck->ct_weight,
+	      ck->ct_weight ? "" : "(draining)",
+	      (ck->ct_flags & CNAT_TRK_FLAG_SNAT_LOW_PORTS) ? " low-ports" : "",
+	      c.packets, c.bytes,
+	      vlib_get_simple_counter (&cnat_path_new_flows, ck - cnat_ep_trk_pool));
   s = format (s, "\n%Ufib-entry:%d", format_white_space, indent, ck->ct_fei);
   s = format (s, "\n%U%U",
 	      format_white_space, indent, format_dpo_id, &ck->ct_dpo, 6);

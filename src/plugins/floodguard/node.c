@@ -476,6 +476,11 @@ floodguard_challenge_reflect (vlib_main_t *vm, vlib_buffer_t *b, u8 *eth,
   u16 victim_port = tcp->dst_port;
   u8 mac[6];
 
+  /* mighty_lb: on an L3 interface the buffer starts at the IP header —
+   * the reply goes out from its Ethernet header. */
+  if ((u8 *) vlib_buffer_get_current (b) != eth)
+    vlib_buffer_advance (b, -(word) ((u8 *) vlib_buffer_get_current (b) - eth));
+
   clib_memcpy_fast (mac, eth, 6);
   clib_memcpy_fast (eth, eth + 6, 6);
   clib_memcpy_fast (eth + 6, mac, 6);
@@ -588,8 +593,16 @@ floodguard_challenge (vlib_main_t *vm, floodguard_main_t *fm, vlib_buffer_t *b,
   return FLOODGUARD_VERDICT_CHALLENGED;
 }
 
-VLIB_NODE_FN (floodguard_victim_node)
-(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+/* floodguard_victim_inline: the victim node on an L2 arc (is_l3 = 0, the
+ * buffer starts at the Ethernet header) or, mighty_lb, on ip4-unicast of
+ * a routed interface (is_l3, network mode l4: the buffer starts at the IP
+ * header, the Ethernet header is still in front of it). The L3 node also
+ * polices the frames sent to a group MAC (broadcast/multicast storm — on
+ * L2 the storm nodes do it before the ACL; here it is one node after the
+ * ACL, whatever the ACL drops never reaches it). */
+static_always_inline uword
+floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+			  vlib_frame_t *frame, int is_l3)
 {
   floodguard_main_t *fm = &floodguard_main;
   u32 *from = vlib_frame_vector_args (frame);
@@ -602,15 +615,14 @@ VLIB_NODE_FN (floodguard_victim_node)
   u32 thread = vm->thread_index;
   int check_victims = fm->n_victims != 0;
   u64 now = clib_cpu_time_now ();
+  u64 pnow = now >> POLICER_TICKS_PER_PERIOD_SHIFT;
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
   while (n_left > 0)
     {
-      u8 *eth = vlib_buffer_get_current (b[0]);
-      u8 *end = eth + b[0]->current_length;
-      ip4_header_t *ip =
-	(ip4_header_t *) (eth + vnet_buffer (b[0])->l2.l2_len);
+      u8 *eth, *end;
+      ip4_header_t *ip;
       floodguard_kind_t kind = FLOODGUARD_KIND_NONE;
       floodguard_verdict_t verdict = FLOODGUARD_VERDICT_PASS;
       clib_bihash_kv_8_8_t kv, val;
@@ -618,7 +630,41 @@ VLIB_NODE_FN (floodguard_victim_node)
       if (n_left > 2)
 	vlib_prefetch_buffer_header (b[2], LOAD);
 
+      if (is_l3)
+	{
+	  ip = vlib_buffer_get_current (b[0]);
+	  end = (u8 *) ip + b[0]->current_length;
+	  eth = (b[0]->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID) ?
+		  b[0]->data + vnet_buffer (b[0])->l2_hdr_offset :
+		  (u8 *) ip - sizeof (ethernet_header_t);
+	}
+      else
+	{
+	  eth = vlib_buffer_get_current (b[0]);
+	  end = eth + b[0]->current_length;
+	  ip = (ip4_header_t *) (eth + vnet_buffer (b[0])->l2.l2_len);
+	}
+
       vnet_feature_next_u16 (next, b[0]);
+
+      if (is_l3 && PREDICT_FALSE (eth[0] & 1))
+	{
+	  u32 sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+	  u32 pi = ~0;
+	  kind = floodguard_l2_kind (eth);
+	  if (sw_if_index < vec_len (fm->ifs))
+	    pi = fm->ifs[sw_if_index].policer[kind - 1];
+	  if (pi != ~0 && floodguard_police (vm, fm, b[0], pi, pnow))
+	    verdict = FLOODGUARD_VERDICT_DROP;
+	  if (verdict == FLOODGUARD_VERDICT_DROP)
+	    {
+	      next[0] = FLOODGUARD_NEXT_DROP;
+	      b[0]->error = node->errors[FLOODGUARD_ERROR_DROP];
+	      drops[kind]++;
+	      n_dropped++;
+	    }
+	  goto done;
+	}
 
       if (!check_victims || (u8 *) (ip + 1) > end)
 	goto done;
@@ -747,6 +793,65 @@ VLIB_NODE_FN (floodguard_victim_node)
 					   0, flood_counts[t][c]);
     }
 
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  return frame->n_vectors;
+}
+
+VLIB_NODE_FN (floodguard_victim_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return floodguard_victim_inline (vm, node, frame, 0);
+}
+
+/* mighty_lb: floodguard-ip4 — the routed (network mode l4) interface's
+ * storm + victim + SYN Challenge node, ip4-unicast after the input ACL. */
+VLIB_NODE_FN (floodguard_ip4_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return floodguard_victim_inline (vm, node, frame, 1);
+}
+
+/* mighty_lb: floodguard-arp — a routed interface's ARP storm policer, on
+ * the "arp" arc before arp-reply/arp-proxy (an L2 interface's ARP goes
+ * through floodguard-l2-nonip instead). */
+VLIB_NODE_FN (floodguard_arp_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 drops[FLOODGUARD_N_KIND] = { 0 };
+  u32 n_dropped = 0;
+  u64 now = clib_cpu_time_now () >> POLICER_TICKS_PER_PERIOD_SHIFT;
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+  while (n_left > 0)
+    {
+      u32 sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+      u32 pi = ~0;
+      int drop = 0;
+
+      vnet_feature_next_u16 (next, b[0]);
+      if (sw_if_index < vec_len (fm->ifs))
+	pi = fm->ifs[sw_if_index].policer[FLOODGUARD_KIND_ARP - 1];
+      if (pi != ~0 && floodguard_police (vm, fm, b[0], pi, now))
+	{
+	  drop = 1;
+	  next[0] = FLOODGUARD_NEXT_DROP;
+	  b[0]->error = node->errors[FLOODGUARD_ERROR_DROP];
+	  drops[FLOODGUARD_KIND_ARP]++;
+	  n_dropped++;
+	}
+      floodguard_trace (vm, node, b[0], sw_if_index, pi, FLOODGUARD_KIND_ARP,
+			drop ? FLOODGUARD_VERDICT_DROP : FLOODGUARD_VERDICT_PASS);
+      b++;
+      next++;
+      n_left--;
+    }
+  if (n_dropped)
+    floodguard_count_drops (vm, fm, drops);
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
   return frame->n_vectors;
 }
@@ -917,6 +1022,8 @@ FLOODGUARD_NODE (floodguard_l2_ip4_node, "floodguard-l2-ip4");
 FLOODGUARD_NODE (floodguard_l2_ip6_node, "floodguard-l2-ip6");
 FLOODGUARD_NODE (floodguard_l2_nonip_node, "floodguard-l2-nonip");
 FLOODGUARD_NODE (floodguard_victim_node, "floodguard-victim");
+FLOODGUARD_NODE (floodguard_ip4_node, "floodguard-ip4");  /* mighty_lb */
+FLOODGUARD_NODE (floodguard_arp_node, "floodguard-arp");  /* mighty_lb */
 
 VNET_FEATURE_INIT (floodguard_l2_ip4_feature, static) = {
   .arc_name = "l2-input-ip4",
@@ -947,4 +1054,21 @@ VNET_FEATURE_INIT (floodguard_wan_reply_feature, static) = {
   .arc_name = "l2-output-ip4",
   .node_name = "floodguard-wan-reply",
   .runs_before = VNET_FEATURES ("acl-plugin-out-ip4-l2"),
+};
+
+/* mighty_lb: routed interfaces (network mode l4). floodguard-ip4 after the
+ * input ACL (blocklist, VIP/WAN allow list) and before the load balancer's
+ * nodes (lb4-vip-echo, then the VIP's lb/cnat DPO at ip4-lookup), so a
+ * challenged SYN never creates a cnat session. */
+VNET_FEATURE_INIT (floodguard_ip4_feature, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "floodguard-ip4",
+  .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa", "ip4-inacl"),
+  .runs_before = VNET_FEATURES ("lb4-vip-echo", "ip4-lookup"),
+};
+
+VNET_FEATURE_INIT (floodguard_arp_feature, static) = {
+  .arc_name = "arp",
+  .node_name = "floodguard-arp",
+  .runs_before = VNET_FEATURES ("arp-reply", "arp-proxy"),
 };

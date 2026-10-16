@@ -999,6 +999,60 @@ out:
   cnat_log_session_create (rsession);
 }
 
+/*
+ * mighty_lb: the return session of a source-NATed VIP flow, with a source
+ * port that makes its key (SNAT address, port) free — the client's own
+ * port when it is in [lo, hi], else up to CNAT_SNAT_PORT_TRIES ports
+ * hashed from flow_id in [lo, hi]. Unlike cnat_rsession_create's sport
+ * search it never overwrites a session: on failure it returns -1 and the
+ * flow is dropped. The key holds the SNAT address, so each address has its
+ * own port space, and the session table insert is the only (lock-free)
+ * synchronisation — the bitmap allocator (cnat_allocate_port: one range
+ * for every address, a spinlock per new flow) is not used.
+ * rw->tuple.port[VLIB_RX] takes the chosen port (network order).
+ */
+static_always_inline int
+cnat_rsession_create_snat_port (cnat_timestamp_rewrite_t *rw, u32 flow_id, u32 ret_fib_index,
+				int add_client, u16 lo, u16 hi)
+{
+  cnat_bihash_kv_t rkey = { 0 };
+  cnat_session_t *rsession = (cnat_session_t *) &rkey;
+  u16 port = clib_net_to_host_u16 (rw->tuple.port[VLIB_RX]);
+  u32 span = (u32) hi - lo + 1;
+  u64 hash = flow_id;
+  int i;
+
+  cnat_5tuple_copy (&rsession->key.cs_5tuple, &rw->tuple, 1 /* swap */);
+  rsession->key.fib_index = ret_fib_index;
+  rsession->value.cs_session_index = flow_id;
+  rsession->value.cs_flags = CNAT_SESSION_IS_RETURN;
+  if (add_client)
+    rsession->value.cs_flags |= CNAT_SESSION_FLAG_HAS_CLIENT;
+
+  if (port >= lo && port <= hi &&
+      0 == cnat_bihash_add_del (&cnat_session_db, &rkey, 2 /* no overwrite */))
+    goto found;
+  for (i = 0; i < CNAT_SNAT_PORT_TRIES; i++)
+    {
+      hash = clib_xxhash (hash + i);
+      port = lo + (u16) (hash % span);
+      rsession->key.cs_5tuple.port[VLIB_TX] = clib_host_to_net_u16 (port);
+      if (0 == cnat_bihash_add_del (&cnat_session_db, &rkey, 2 /* no overwrite */))
+	goto found;
+    }
+  return -1;
+
+found:
+  rw->tuple.port[VLIB_RX] = clib_host_to_net_u16 (port);
+  if (add_client)
+    {
+      cnat_rsession_create_client (rw, CNAT_FIB_TABLE);
+      cnat_client_throttle_pool_process ();
+    }
+  cnat_log_session_create (rsession);
+  return 0;
+}
+
 static_always_inline void
 cnat_set_rw_next_node (vlib_buffer_t *b, const cnat_timestamp_rewrite_t *rw, u16 *next0)
 {

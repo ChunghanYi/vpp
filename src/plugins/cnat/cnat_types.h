@@ -51,6 +51,17 @@
 
 #define MIN_SRC_PORT ((u16) 0xC000)
 
+/* mighty_lb: source ports of a source-NATed VIP flow (ALLOC_PORT), chosen
+ * with its return session (cnat_rsession_create_snat_port): the whole
+ * range for a dedicated SNAT address, the low range for an interface
+ * address (CNAT_TRK_FLAG_SNAT_LOW_PORTS) — Linux's ephemeral ports start
+ * at 32768. Same ranges as Kernel mode (ebpf/xdp_lb). */
+#define CNAT_SNAT_PORT_MIN     1024
+#define CNAT_SNAT_PORT_MAX     65535
+#define CNAT_SNAT_LOW_PORT_MIN 1024
+#define CNAT_SNAT_LOW_PORT_MAX 32767
+#define CNAT_SNAT_PORT_TRIES   16
+
 typedef struct
 {
   /* Source and destination port. */
@@ -71,6 +82,11 @@ typedef enum cnat_trk_flag_t_
   CNAT_TRK_ACTIVE = (1 << 2),
   /* endpoint marked to be deleted */
   CNAT_TRK_MARKED_FOR_DELETE = (1 << 3),
+  /* mighty_lb: the source NAT address of this path is an interface
+   * address the box's own stack also uses — allocated source ports stay
+   * in [CNAT_SNAT_LOW_PORT_MIN, CNAT_SNAT_LOW_PORT_MAX], below Linux's
+   * ephemeral range, instead of the whole [1024, 65535]. */
+  CNAT_TRK_FLAG_SNAT_LOW_PORTS = (1 << 4),
   /* */
   CNAT_TRK_FLAG_TEST_DISABLED = (1 << 7),
 } cnat_trk_flag_t;
@@ -94,6 +110,9 @@ typedef struct cnat_endpoint_tuple_t_
   cnat_endpoint_t dst_ep;
   cnat_endpoint_t src_ep;
   u8 ep_flags; /* cnat_trk_flag_t */
+  /* mighty_lb: share of new flows; 0 = draining (kept for the sessions
+   * it has, given no new ones) */
+  u8 ep_weight;
 } cnat_endpoint_tuple_t;
 
 /**
@@ -125,6 +144,9 @@ typedef struct cnat_ep_trk_t_
    * Allows to disable if not resolved yet
    */
   u8 ct_flags; /* cnat_trk_flag_t */
+
+  /* mighty_lb: see cnat_endpoint_tuple_t.ep_weight */
+  u8 ct_weight;
 } cnat_ep_trk_t;
 
 typedef struct

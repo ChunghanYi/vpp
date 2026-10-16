@@ -533,4 +533,45 @@ static int api_lb_as_dump (vat_main_t * vam)
   return ret;
 }
 
+/* mighty_lb additions: driven by virtserver (govpp), not VAT */
+static int
+api_lb_add_del_as_v2 (vat_main_t *vam)
+{
+  return -99;
+}
+
+static int
+api_lb_vip_v2_dump (vat_main_t *vam)
+{
+  return -99;
+}
+
+static void
+vl_api_lb_vip_v2_details_t_handler (vl_api_lb_vip_v2_details_t *mp)
+{
+}
+
+static int
+api_lb_as_v2_dump (vat_main_t *vam)
+{
+  return -99;
+}
+
+static void
+vl_api_lb_as_v2_details_t_handler (vl_api_lb_as_v2_details_t *mp)
+{
+}
+
+static int
+api_lb_vip_echo_add_del (vat_main_t *vam)
+{
+  return -99;
+}
+
+static int
+api_lb_vip_echo_enable_disable (vat_main_t *vam)
+{
+  return -99;
+}
+
 #include <lb/lb.api_test.c>

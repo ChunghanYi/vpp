@@ -1,4 +1,4 @@
-option version = "1.1.0";
+option version = "1.2.0";
 import "plugins/lb/lb_types.api";
 import "vnet/interface_types.api";
 
@@ -205,4 +205,91 @@ autoreply define lb_add_del_intf_nat6 {
   u32 context;
   bool is_add;
   vl_api_interface_index_t sw_if_index;
+};
+
+/*
+ * mighty_lb additions
+ */
+
+/** \brief Add/del an AS with a weight; adding an AS already in use sets
+    its weight (its new-flow share, 1-255).
+*/
+autoreply define lb_add_del_as_v2 {
+  u32 client_index;
+  u32 context;
+  vl_api_address_with_prefix_t pfx;
+  u8 protocol [default=255];
+  u16 port;
+  vl_api_address_t as_address;
+  u8 weight [default=1];
+  bool is_del;
+  bool is_flush;
+  option vat_help = "<vip-prefix> [protocol (tcp|udp) port <n>] [<address>] [weight <n>] [del] [flush]";
+};
+
+/** \brief Dump every VIP with its counters. vip_plen is the prefix length
+    in its own family (32 for an IPv4 /32).
+*/
+define lb_vip_v2_dump {
+  u32 client_index;
+  u32 context;
+};
+
+define lb_vip_v2_details {
+  u32 context;
+  vl_api_address_t vip;
+  u8 vip_plen;
+  u8 protocol;
+  u16 port;
+  vl_api_lb_vip_type_t type;
+  u8 dscp;
+  bool src_ip_sticky;
+  u32 flow_table_length;
+  u64 next_packets;
+  u64 first_packets;
+  u64 untracked_packets;
+  u64 no_server_packets;
+};
+
+/** \brief Dump every AS of every VIP with its weight and counters.
+    flags bit 0 = in use (not removed), active_flows = flow table entries
+    still pointing at it.
+*/
+define lb_as_v2_dump {
+  u32 client_index;
+  u32 context;
+};
+
+define lb_as_v2_details {
+  u32 context;
+  vl_api_address_t vip;
+  u8 vip_plen;
+  u8 protocol;
+  u16 port;
+  vl_api_address_t as_address;
+  u8 weight;
+  u8 flags;
+  u16 mtu;
+  u32 in_use_since;
+  u32 active_flows;
+  u64 packets;
+  u64 bytes;
+  u64 new_flows;
+};
+
+/** \brief Answer (or stop answering) ICMP echo requests to a VIP address
+    on the interfaces lb_vip_echo_enable_disable turned on.
+*/
+autoreply define lb_vip_echo_add_del {
+  u32 client_index;
+  u32 context;
+  vl_api_ip4_address_t address;
+  bool is_add;
+};
+
+autoreply define lb_vip_echo_enable_disable {
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  bool enable;
 };

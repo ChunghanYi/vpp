@@ -62,6 +62,10 @@ lb_vip_command_fn (vlib_main_t * vm,
       encap = LB_ENCAP_TYPE_NAT4;
     else if (unformat(line_input, "encap nat6"))
       encap = LB_ENCAP_TYPE_NAT6;
+    else if (unformat(line_input, "encap ipip4"))
+      encap = LB_ENCAP_TYPE_IPIP4;
+    else if (unformat(line_input, "encap l2dsr"))
+      encap = LB_ENCAP_TYPE_L2DSR;
     else if (unformat(line_input, "dscp %d", &dscp))
       ;
     else if (unformat(line_input, "type clusterip"))
@@ -112,6 +116,10 @@ lb_vip_command_fn (vlib_main_t * vm,
         args.type = LB_VIP_TYPE_IP4_L3DSR;
       else if (encap == LB_ENCAP_TYPE_NAT4)
         args.type = LB_VIP_TYPE_IP4_NAT4;
+      else if (encap == LB_ENCAP_TYPE_IPIP4)
+        args.type = LB_VIP_TYPE_IP4_IPIP4;
+      else if (encap == LB_ENCAP_TYPE_L2DSR)
+        args.type = LB_VIP_TYPE_IP4_L2DSR;
       else if (encap == LB_ENCAP_TYPE_NAT6)
         {
           error = clib_error_return(0, "currently does not support NAT46");
@@ -126,9 +134,10 @@ lb_vip_command_fn (vlib_main_t * vm,
         args.type = LB_VIP_TYPE_IP6_GRE6;
       else if (encap == LB_ENCAP_TYPE_NAT6)
         args.type = LB_VIP_TYPE_IP6_NAT6;
-      else if (encap == LB_ENCAP_TYPE_NAT4)
+      else if (encap == LB_ENCAP_TYPE_NAT4 || encap == LB_ENCAP_TYPE_IPIP4 ||
+               encap == LB_ENCAP_TYPE_L2DSR)
         {
-          error = clib_error_return(0, "currently does not support NAT64");
+          error = clib_error_return(0, "IPv4 VIPs only");
           goto done;
         }
     }
@@ -176,7 +185,7 @@ VLIB_CLI_COMMAND (lb_vip_command, static) =
   .path = "lb vip",
   .short_help = "lb vip <prefix> "
       "[protocol (tcp|udp) port <n>] "
-      "[encap (gre6|gre4|l3dsr|nat4|nat6)] "
+      "[encap (gre6|gre4|l3dsr|nat4|nat6|ipip4|l2dsr)] "
       "[dscp <n>] "
       "[type (nodeport|clusterip) target_port <n>] "
       "[new_len <n>] [src_ip_sticky] [del]",
@@ -197,6 +206,7 @@ lb_as_command_fn (vlib_main_t * vm,
   u8 protocol = 0;
   u8 del = 0;
   u8 flush = 0;
+  u32 weight = 0; /* mighty_lb */
   int ret;
   clib_error_t *error = 0;
 
@@ -217,6 +227,14 @@ lb_as_command_fn (vlib_main_t * vm,
                  &as_addr, IP46_TYPE_ANY))
       {
         vec_add1(as_array, as_addr);
+      }
+    else if (unformat(line_input, "weight %u", &weight))
+      {
+        if (weight < 1 || weight > 255)
+          {
+            error = clib_error_return (0, "weight must be 1-255");
+            goto done;
+          }
       }
     else if (unformat(line_input, "del"))
       {
@@ -270,7 +288,18 @@ lb_as_command_fn (vlib_main_t * vm,
       goto done;
     }
   } else {
-    if ((ret = lb_vip_add_ass(vip_index, as_array, vec_len(as_array))))
+    /* mighty_lb: "weight <n>" applies to every address given (and
+     * changes it for an AS already in use) */
+    u8 *weights = 0;
+    if (weight)
+      {
+        u32 k;
+        for (k = 0; k < vec_len (as_array); k++)
+          vec_add1 (weights, (u8) weight);
+      }
+    ret = lb_vip_add_ass(vip_index, as_array, weights, vec_len(as_array));
+    vec_free (weights);
+    if (ret)
     {
       error = clib_error_return (0, "lb_vip_add_ass error %d", ret);
       goto done;
@@ -288,7 +317,7 @@ VLIB_CLI_COMMAND (lb_as_command, static) =
 {
   .path = "lb as",
   .short_help = "lb as <vip-prefix> [protocol (tcp|udp) port <n>]"
-      " [<address> [<address> [...]]] [del] [flush]",
+      " [<address> [<address> [...]]] [weight <1-255>] [del] [flush]",
   .function = lb_as_command_fn,
 };
 
@@ -583,4 +612,58 @@ VLIB_CLI_COMMAND (lb_flowtable_flush_command, static) =
   .path = "test lb flowtable flush",
   .short_help = "test lb flowtable flush",
   .function = lb_flowtable_flush_command_fn,
+};
+
+/* mighty_lb: VIP ICMP echo (lb4-vip-echo) */
+static clib_error_t *
+lb_vip_echo_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                        vlib_cli_command_t *cmd)
+{
+  unformat_input_t _line_input, *line_input = &_line_input;
+  vnet_main_t *vnm = vnet_get_main ();
+  ip4_address_t addr;
+  u32 sw_if_index = ~0;
+  u8 is_add = 1, have_addr = 0;
+  clib_error_t *error = 0;
+  int rv;
+
+  if (!unformat_user (input, unformat_line_input, line_input))
+    return 0;
+  while (unformat_check_input (line_input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
+                    vnm, &sw_if_index))
+        ;
+      else if (unformat (line_input, "%U", unformat_ip4_address, &addr))
+        have_addr = 1;
+      else if (unformat (line_input, "del") ||
+               unformat (line_input, "disable"))
+        is_add = 0;
+      else
+        {
+          error = clib_error_return (0, "parse error: '%U'",
+                                     format_unformat_error, line_input);
+          goto done;
+        }
+    }
+  if (sw_if_index != ~0)
+    rv = lb_vip_echo_enable_disable (sw_if_index, is_add);
+  else if (have_addr)
+    rv = lb_vip_echo_add_del (&addr, is_add);
+  else
+    {
+      error = clib_error_return (0, "an address or 'interface <if>' expected");
+      goto done;
+    }
+  if (rv)
+    error = clib_error_return (0, "lb vip-echo error %d", rv);
+done:
+  unformat_free (line_input);
+  return error;
+}
+
+VLIB_CLI_COMMAND (lb_vip_echo_command, static) = {
+  .path = "lb vip-echo",
+  .short_help = "lb vip-echo <ip4-address> [del] | interface <if> [disable]",
+  .function = lb_vip_echo_command_fn,
 };

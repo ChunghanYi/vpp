@@ -14,6 +14,7 @@ typedef struct
   u32 offset;
   u32 skip;
   u32 index;
+  u32 weight; /* mighty_lb */
 } cnat_maglev_perm_t;
 
 extern void cnat_translation_init_maglev (cnat_translation_t *ct);
