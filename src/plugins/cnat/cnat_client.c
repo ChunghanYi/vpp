@@ -67,10 +67,42 @@ cnat_client_db_add (cnat_client_t *cc, u32 fib_index)
   clib_bihash_add_del_24_8 (&cnat_client_db.cc_ip_id_hash, &bkey, 1 /* add */);
 }
 
+/*
+ * mighty_lb: for the lb plugin's lb4-vip-dispatch, which sends a VIP's
+ * packets to ip4-cnat-tx with the VIP's client index (looked up by name
+ * with vlib_get_plugin_symbol): the index of an address's client, and
+ * the callbacks told of a client about to be freed (so no index outlives
+ * its client).
+ */
+typedef void (*cnat_client_del_cb_t) (u32 cci);
+static cnat_client_del_cb_t *cnat_client_del_cbs;
+
+__clib_export void
+cnat_client_register_del_cb (cnat_client_del_cb_t cb)
+{
+  vec_add1 (cnat_client_del_cbs, cb);
+}
+
+/* ~0 when the address has no client, or one without a FIB entry */
+__clib_export u32
+cnat_client_ip4_index (const ip4_address_t *ip, u32 fib_index)
+{
+  cnat_client_t *cc = cnat_client_ip4_find (ip, fib_index);
+
+  if (!cc || (cc->flags & CNAT_TR_FLAG_NO_CLIENT))
+    return ~0;
+  return cc - cnat_client_pool;
+}
+
 static void
 cnat_client_destroy (cnat_client_t *cc, u32 fib_index)
 {
+  cnat_client_del_cb_t *cb;
+
   ASSERT (!cnat_client_is_clone (cc));
+
+  vec_foreach (cb, cnat_client_del_cbs)
+    (*cb) (cc - cnat_client_pool);
 
   if (cc->flags & CNAT_TR_FLAG_NO_CLIENT)
     cnat_client_db_remove (cc, fib_index);

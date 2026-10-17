@@ -614,16 +614,17 @@ VLIB_CLI_COMMAND (lb_flowtable_flush_command, static) =
   .function = lb_flowtable_flush_command_fn,
 };
 
-/* mighty_lb: VIP ICMP echo (lb4-vip-echo) */
+/* mighty_lb: VIP dispatch (lb4-vip-dispatch) */
 static clib_error_t *
-lb_vip_echo_command_fn (vlib_main_t *vm, unformat_input_t *input,
-                        vlib_cli_command_t *cmd)
+lb_vip_dispatch_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                            vlib_cli_command_t *cmd)
 {
   unformat_input_t _line_input, *line_input = &_line_input;
   vnet_main_t *vnm = vnet_get_main ();
   ip4_address_t addr;
-  u32 sw_if_index = ~0;
-  u8 is_add = 1, have_addr = 0;
+  u32 sw_if_index = ~0, port = 0;
+  u8 is_add = 1, have_addr = 0, protocol = 0;
+  lb_vip_dispatch_kind_t kind = 0;
   clib_error_t *error = 0;
   int rv;
 
@@ -634,8 +635,20 @@ lb_vip_echo_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (unformat (line_input, "interface %U", unformat_vnet_sw_interface,
                     vnm, &sw_if_index))
         ;
-      else if (unformat (line_input, "%U", unformat_ip4_address, &addr))
-        have_addr = 1;
+      else if (unformat (line_input, "echo %U", unformat_ip4_address, &addr))
+        {
+          kind = LB_VIP_DISPATCH_KIND_ECHO;
+          have_addr = 1;
+        }
+      else if (unformat (line_input, "cnat %U", unformat_ip4_address, &addr))
+        {
+          kind = LB_VIP_DISPATCH_KIND_CNAT;
+          have_addr = 1;
+        }
+      else if (unformat (line_input, "tcp %u", &port))
+        protocol = IP_PROTOCOL_TCP;
+      else if (unformat (line_input, "udp %u", &port))
+        protocol = IP_PROTOCOL_UDP;
       else if (unformat (line_input, "del") ||
                unformat (line_input, "disable"))
         is_add = 0;
@@ -647,23 +660,64 @@ lb_vip_echo_command_fn (vlib_main_t *vm, unformat_input_t *input,
         }
     }
   if (sw_if_index != ~0)
-    rv = lb_vip_echo_enable_disable (sw_if_index, is_add);
-  else if (have_addr)
-    rv = lb_vip_echo_add_del (&addr, is_add);
+    rv = lb_vip_dispatch_enable_disable (sw_if_index, is_add);
+  else if (have_addr && port <= 0xffff)
+    rv = lb_vip_dispatch_add_del (&addr, protocol, (u16) port, kind, is_add);
   else
     {
-      error = clib_error_return (0, "an address or 'interface <if>' expected");
+      error = clib_error_return (
+        0, "'echo <ip4>', 'cnat <ip4> (tcp|udp) <port>' or "
+           "'interface <if>' expected");
       goto done;
     }
   if (rv)
-    error = clib_error_return (0, "lb vip-echo error %d", rv);
+    error = clib_error_return (0, "lb vip-dispatch error %d", rv);
 done:
   unformat_free (line_input);
   return error;
 }
 
-VLIB_CLI_COMMAND (lb_vip_echo_command, static) = {
-  .path = "lb vip-echo",
-  .short_help = "lb vip-echo <ip4-address> [del] | interface <if> [disable]",
-  .function = lb_vip_echo_command_fn,
+VLIB_CLI_COMMAND (lb_vip_dispatch_command, static) = {
+  .path = "lb vip-dispatch",
+  .short_help = "lb vip-dispatch echo <ip4> [del] | cnat <ip4> (tcp|udp) "
+                "<port> [del] | interface <if> [disable]",
+  .function = lb_vip_dispatch_command_fn,
+};
+
+static int
+lb_vip_dispatch_show_walk (clib_bihash_kv_8_8_t *kv, void *arg)
+{
+  vlib_main_t *vm = arg;
+  static const char *kinds[] = { "?", "lb vip prefix", "cnat client", "echo" };
+  ip4_address_t addr = { .as_u32 = (u32) (kv->key >> 32) };
+  u8 kind = lb_vip_dispatch_value_kind (kv->value);
+  u8 protocol = (u8) (kv->key >> 16);
+
+  if (kind == LB_VIP_DISPATCH_KIND_ECHO)
+    vlib_cli_output (vm, "  %U icmp echo", format_ip4_address, &addr);
+  else
+    vlib_cli_output (vm, "  %U %s %u -> %s %u", format_ip4_address, &addr,
+                     protocol == IP_PROTOCOL_TCP ? "tcp" : "udp",
+                     (u16) kv->key,
+                     kind < ARRAY_LEN (kinds) ? kinds[kind] : "?",
+                     lb_vip_dispatch_value_index (kv->value));
+  return BIHASH_WALK_CONTINUE;
+}
+
+static clib_error_t *
+lb_show_vip_dispatch_command_fn (vlib_main_t *vm, unformat_input_t *input,
+                                 vlib_cli_command_t *cmd)
+{
+  lb_main_t *lbm = &lb_main;
+
+  vlib_cli_output (vm, "lb vip dispatch: %u entries", lbm->n_vip_dispatch);
+  clib_bihash_foreach_key_value_pair_8_8 (&lbm->vip_dispatch,
+                                          lb_vip_dispatch_show_walk, vm);
+  return 0;
+}
+
+VLIB_CLI_COMMAND (lb_show_vip_dispatch_command, static) = {
+  .path = "show lb vip-dispatch",
+  .short_help = "show lb vip-dispatch",
+  .function = lb_show_vip_dispatch_command_fn,
 };

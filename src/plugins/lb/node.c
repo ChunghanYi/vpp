@@ -13,7 +13,8 @@
 #define foreach_lb_error \
  _(NONE, "no error") \
  _(PROTO_NOT_SUPPORTED, "protocol not supported") \
- _(FRAG_NEEDED, "fragmentation needed (DF, encap over path MTU)")
+ _(FRAG_NEEDED, "fragmentation needed (DF, encap over path MTU)") \
+ _(VIP_TYPE, "per-port VIP of another type (not via lb4-vip-dispatch)")
 
 typedef enum
 {
@@ -337,6 +338,19 @@ lb_node_fn (vlib_main_t * vm,
           p0 = vlib_get_buffer (vm, pi0);
 
           vip0 = pool_elt_at_index(lbm->vips, vip_index0);
+
+          /* mighty_lb: a prefix's FIB entry leads to its first per-port
+           * VIP's node; a VIP of another type that comes this way (not
+           * through lb4-vip-dispatch) is not encapsulated wrongly */
+          if (per_port_vip && vip_index0 != 0 &&
+              PREDICT_FALSE (lb_vip_encap_type (vip0) != encap_type))
+            {
+              vlib_node_increment_counter (vm, node->node_index,
+                                           LB_ERROR_VIP_TYPE, 1);
+              asindex0 = 0;
+              next0 = LB_NEXT_DROP;
+              goto lb_enqueue0;
+            }
 
           if (is_input_v4)
             {
@@ -1437,98 +1451,165 @@ VLIB_REGISTER_NODE (lb_nat6_in2out_node) =
   };
 
 /*
- * mighty_lb: lb4-vip-echo — ip4-unicast feature of the WAN interface,
- * after the input ACL: an ICMP echo request to a VIP in lbm->vip_echo is
- * answered here (source = the VIP), since the VIP's FIB entry (lb or cnat)
- * would otherwise take it to a load-balancing node that drops it. Every
- * other packet goes on along the arc after a protocol test.
+ * mighty_lb: lb4-vip-dispatch — ip4-unicast feature of the interfaces VIP
+ * traffic comes in on (the WAN), after the input ACL and floodguard. One
+ * lbm->vip_dispatch lookup on (dst, protocol, dst port) sends a VIP's
+ * packet to its service's node: the per-port encap node of the VIP's type
+ * with the prefix index (it finds the VIP by port, and the ASs' DPOs are
+ * stacked for that node) or cnat's ip4-cnat-tx with the VIP's client
+ * index — both read the index from adj_index[VLIB_TX], as from their DPO —
+ * or answers ICMP echo (source = the VIP). The lookup replaces ip4-lookup for these packets, so a VIP's
+ * services may differ in mode although its FIB entry leads to one DPO.
+ * Everything else — no entry, non-first fragments, other ICMP — goes on
+ * along the arc to ip4-lookup.
  */
-typedef enum
-{
-  LB_VIP_ECHO_NEXT_LOOKUP,
-  LB_VIP_ECHO_N_NEXT,
-} lb_vip_echo_next_t;
-
-#define foreach_lb_vip_echo_error _ (REPLIED, "VIP echo replies sent")
+#define foreach_lb_vip_dispatch_error                                         \
+  _ (LB, "VIP packets to lb")                                                 \
+  _ (CNAT, "VIP packets to cnat")                                             \
+  _ (REPLIED, "VIP echo replies sent")
 
 typedef enum
 {
-#define _(sym, str) LB_VIP_ECHO_ERROR_##sym,
-  foreach_lb_vip_echo_error
+#define _(sym, str) LB_VIP_DISPATCH_ERROR_##sym,
+  foreach_lb_vip_dispatch_error
 #undef _
-    LB_VIP_ECHO_N_ERROR,
-} lb_vip_echo_error_t;
+    LB_VIP_DISPATCH_N_ERROR,
+} lb_vip_dispatch_error_t;
 
-static char *lb_vip_echo_error_strings[] = {
+static char *lb_vip_dispatch_error_strings[] = {
 #define _(sym, string) string,
-  foreach_lb_vip_echo_error
+  foreach_lb_vip_dispatch_error
 #undef _
 };
 
 typedef struct
 {
-  ip4_address_t vip;
-  u32 replied;
-} lb_vip_echo_trace_t;
+  ip4_address_t dst;
+  u16 port;
+  u8 protocol;
+  u8 kind; /* 0 = no entry */
+  u32 index;
+} lb_vip_dispatch_trace_t;
 
 static u8 *
-format_lb_vip_echo_trace (u8 *s, va_list *args)
+format_lb_vip_dispatch_trace (u8 *s, va_list *args)
 {
   CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
-  lb_vip_echo_trace_t *t = va_arg (*args, lb_vip_echo_trace_t *);
-  return format (s, "lb vip echo: dst %U %s", format_ip4_address, &t->vip,
-                 t->replied ? "replied" : "passed");
+  lb_vip_dispatch_trace_t *t = va_arg (*args, lb_vip_dispatch_trace_t *);
+  static const char *kinds[] = { "passed", "lb vip prefix", "cnat client",
+                                 "echo" };
+  s = format (s, "lb vip dispatch: dst %U proto %u port %u: %s",
+              format_ip4_address, &t->dst, t->protocol, t->port,
+              t->kind < ARRAY_LEN (kinds) ? kinds[t->kind] : "?");
+  if (t->kind == LB_VIP_DISPATCH_KIND_LB ||
+      t->kind == LB_VIP_DISPATCH_KIND_CNAT)
+    s = format (s, " %u", t->index);
+  return s;
+}
+
+/* the dispatch key of an IPv4 packet, ~0 when it has none (no TCP/UDP
+ * port to look at: non-first fragment, other protocol) */
+static_always_inline u64
+lb_vip_dispatch_key4 (ip4_header_t *ip)
+{
+  if (PREDICT_FALSE (ip4_get_fragment_offset (ip) != 0))
+    return ~0ULL;
+  if (PREDICT_TRUE (ip->protocol == IP_PROTOCOL_TCP ||
+                    ip->protocol == IP_PROTOCOL_UDP))
+    {
+      udp_header_t *udp = ip4_next_header (ip);
+      return lb_vip_dispatch_key (ip->dst_address.as_u32, ip->protocol,
+                                  clib_net_to_host_u16 (udp->dst_port));
+    }
+  if (ip->protocol == IP_PROTOCOL_ICMP && !ip4_is_fragment (ip) &&
+      ((icmp46_header_t *) ip4_next_header (ip))->type == ICMP4_echo_request)
+    return lb_vip_dispatch_key (ip->dst_address.as_u32, IP_PROTOCOL_ICMP, 0);
+  return ~0ULL;
+}
+
+static_always_inline void
+lb_vip_echo_reply (ip4_header_t *ip0)
+{
+  icmp46_header_t *icmp0 = ip4_next_header (ip0);
+  ip4_address_t src0 = ip0->src_address;
+  ip_csum_t sum0 = icmp0->checksum;
+
+  sum0 = ip_csum_update (sum0, ICMP4_echo_request, ICMP4_echo_reply,
+                         icmp46_header_t, type);
+  icmp0->type = ICMP4_echo_reply;
+  icmp0->checksum = ip_csum_fold (sum0);
+  ip0->src_address = ip0->dst_address;
+  ip0->dst_address = src0;
+  ip0->ttl = 64;
+  ip0->checksum = ip4_header_checksum (ip0);
 }
 
 static uword
-lb4_vip_echo_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
-                      vlib_frame_t *frame)
+lb4_vip_dispatch_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
+                          vlib_frame_t *frame)
 {
   lb_main_t *lbm = &lb_main;
   u32 n_left = frame->n_vectors, *from = vlib_frame_vector_args (frame);
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
-  u32 n_replied = 0;
+  u32 n_lb = 0, n_cnat = 0, n_replied = 0;
+  u8 any = lbm->n_vip_dispatch != 0;
 
   vlib_get_buffers (vm, from, bufs, n_left);
   while (n_left > 0)
     {
       ip4_header_t *ip0 = vlib_buffer_get_current (b[0]);
+      clib_bihash_kv_8_8_t kv, v;
       u32 next0;
-      u8 replied0 = 0;
+      u8 kind0 = 0;
+
+      if (n_left > 2)
+        {
+          vlib_prefetch_buffer_header (b[2], LOAD);
+          CLIB_PREFETCH (vlib_buffer_get_current (b[1]), CLIB_CACHE_LINE_BYTES,
+                         LOAD);
+        }
 
       vnet_feature_next (&next0, b[0]);
-      if (PREDICT_FALSE (ip0->protocol == IP_PROTOCOL_ICMP &&
-                         lbm->n_vip_echo != 0 && !ip4_is_fragment (ip0)))
+      if (PREDICT_TRUE (any) &&
+          (kv.key = lb_vip_dispatch_key4 (ip0)) != ~0ULL &&
+          clib_bihash_search_8_8 (&lbm->vip_dispatch, &kv, &v) == 0)
         {
-          icmp46_header_t *icmp0 = ip4_next_header (ip0);
-          clib_bihash_kv_8_8_t kv = { .key = ip0->dst_address.as_u32 }, v;
-          if (icmp0->type == ICMP4_echo_request &&
-              clib_bihash_search_8_8 (&lbm->vip_echo, &kv, &v) == 0)
+          kind0 = lb_vip_dispatch_value_kind (v.value);
+          if (PREDICT_TRUE (kind0 != LB_VIP_DISPATCH_KIND_ECHO))
             {
-              ip4_address_t src0 = ip0->src_address;
-              ip_csum_t sum0 = icmp0->checksum;
-              sum0 = ip_csum_update (sum0, ICMP4_echo_request,
-                                     ICMP4_echo_reply, icmp46_header_t, type);
-              icmp0->type = ICMP4_echo_reply;
-              icmp0->checksum = ip_csum_fold (sum0);
-              ip0->src_address = ip0->dst_address;
-              ip0->dst_address = src0;
-              ip0->ttl = 64;
-              ip0->checksum = ip4_header_checksum (ip0);
+              vnet_buffer (b[0])->ip.adj_index[VLIB_TX] =
+                lb_vip_dispatch_value_index (v.value);
+              next0 = lb_vip_dispatch_value_next (v.value);
+              if (kind0 == LB_VIP_DISPATCH_KIND_LB)
+                n_lb++;
+              else
+                n_cnat++;
+            }
+          else
+            {
+              lb_vip_echo_reply (ip0);
               /* the receiving interface's FIB */
               vnet_buffer (b[0])->sw_if_index[VLIB_TX] = ~0;
-              next0 = LB_VIP_ECHO_NEXT_LOOKUP;
-              replied0 = 1;
+              next0 = LB_VIP_DISPATCH_NEXT_LOOKUP;
               n_replied++;
             }
         }
       if (PREDICT_FALSE (b[0]->flags & VLIB_BUFFER_IS_TRACED))
         {
-          lb_vip_echo_trace_t *t = vlib_add_trace (vm, node, b[0], sizeof (*t));
-          t->vip = replied0 ? ip0->src_address : ip0->dst_address;
-          t->replied = replied0;
+          lb_vip_dispatch_trace_t *t =
+            vlib_add_trace (vm, node, b[0], sizeof (*t));
+          t->dst = kind0 == LB_VIP_DISPATCH_KIND_ECHO ? ip0->src_address :
+                                                        ip0->dst_address;
+          t->protocol = ip0->protocol;
+          t->port = (ip0->protocol == IP_PROTOCOL_TCP ||
+                     ip0->protocol == IP_PROTOCOL_UDP) ?
+                      clib_net_to_host_u16 (
+                        ((udp_header_t *) ip4_next_header (ip0))->dst_port) :
+                      0;
+          t->kind = kind0;
+          t->index = kind0 ? lb_vip_dispatch_value_index (v.value) : ~0;
         }
       next[0] = next0;
       b++;
@@ -1536,27 +1617,39 @@ lb4_vip_echo_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
       n_left--;
     }
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  if (n_lb)
+    vlib_node_increment_counter (vm, node->node_index,
+                                 LB_VIP_DISPATCH_ERROR_LB, n_lb);
+  if (n_cnat)
+    vlib_node_increment_counter (vm, node->node_index,
+                                 LB_VIP_DISPATCH_ERROR_CNAT, n_cnat);
   if (n_replied)
     vlib_node_increment_counter (vm, node->node_index,
-                                 LB_VIP_ECHO_ERROR_REPLIED, n_replied);
+                                 LB_VIP_DISPATCH_ERROR_REPLIED, n_replied);
   return frame->n_vectors;
 }
 
-VLIB_REGISTER_NODE (lb4_vip_echo_node) = {
-  .function = lb4_vip_echo_node_fn,
-  .name = "lb4-vip-echo",
+VLIB_REGISTER_NODE (lb4_vip_dispatch_node) = {
+  .function = lb4_vip_dispatch_node_fn,
+  .name = "lb4-vip-dispatch",
   .vector_size = sizeof (u32),
-  .format_trace = format_lb_vip_echo_trace,
+  .format_trace = format_lb_vip_dispatch_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,
-  .n_errors = LB_VIP_ECHO_N_ERROR,
-  .error_strings = lb_vip_echo_error_strings,
-  .n_next_nodes = LB_VIP_ECHO_N_NEXT,
-  .next_nodes = { [LB_VIP_ECHO_NEXT_LOOKUP] = "ip4-lookup" },
+  .n_errors = LB_VIP_DISPATCH_N_ERROR,
+  .error_strings = lb_vip_dispatch_error_strings,
+  .n_next_nodes = LB_VIP_DISPATCH_N_NEXT,
+  .next_nodes = {
+    [LB_VIP_DISPATCH_NEXT_LOOKUP] = "ip4-lookup",
+    [LB_VIP_DISPATCH_NEXT_GRE4] = "lb4-gre4-port",
+    [LB_VIP_DISPATCH_NEXT_IPIP4] = "lb4-ipip4-port",
+    [LB_VIP_DISPATCH_NEXT_L3DSR] = "lb4-l3dsr-port",
+    [LB_VIP_DISPATCH_NEXT_L2DSR] = "lb4-l2dsr-port",
+  },
 };
 
-VNET_FEATURE_INIT (lb4_vip_echo_feature, static) = {
+VNET_FEATURE_INIT (lb4_vip_dispatch_feature, static) = {
   .arc_name = "ip4-unicast",
-  .node_name = "lb4-vip-echo",
+  .node_name = "lb4-vip-dispatch",
   .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa", "floodguard-ip4"),
   .runs_before = VNET_FEATURES ("ip4-lookup"),
 };

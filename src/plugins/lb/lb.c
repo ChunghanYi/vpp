@@ -21,6 +21,8 @@
 // FIB source for adding routes
 static fib_source_t lb_fib_src;
 
+static void lb_vip_dispatch_lb (lb_vip_t *vip, u8 is_add); /* mighty_lb */
+
 lb_main_t lb_main;
 
 #define lb_get_writer_lock() clib_spinlock_lock (&lb_main.writer_lock)
@@ -1159,11 +1161,16 @@ int lb_vip_add(lb_vip_add_args_t args, u32 *vip_index)
       return VNET_API_ERROR_VALUE_EXIST;
     }
 
-  /* Make sure all VIP for a given prefix (using different ports) have the same type. */
+  /* mighty_lb: the per-port VIPs of a prefix may differ in type (was
+   * refused): lb4-vip-dispatch takes each to its own encap node, and the
+   * prefix's FIB entry keeps the first one's (the other types' packets
+   * that come that way are dropped by the encap node, VIP_TYPE). Both
+   * address families must still match. */
   if ((args.port != 0) &&
       !lb_vip_port_find_diff_port(&(args.prefix), args.plen,
                                   args.protocol, args.port, vip_index)
-      && (args.type != lbm->vips[*vip_index].type))
+      && (lb_vip_is_ip4 (args.type) !=
+          lb_vip_is_ip4 (lbm->vips[*vip_index].type)))
     {
       lb_put_writer_lock();
       return VNET_API_ERROR_INVALID_ARGUMENT;
@@ -1274,6 +1281,7 @@ int lb_vip_add(lb_vip_add_args_t args, u32 *vip_index)
       lb_vip_add_port_filter(lbm, vip, vip_prefix_index, *vip_index);
       vip->vip_prefix_index = vip_prefix_index;
     }
+  lb_vip_dispatch_lb (vip, 1); /* mighty_lb */
 
   lb_put_writer_lock();
   return 0;
@@ -1312,6 +1320,8 @@ int lb_vip_del(u32 vip_index)
       lb_vip_del_ass_withlock(vip_index, ass, vec_len(ass), 0);
     vec_free(ass);
   }
+
+  lb_vip_dispatch_lb (vip, 0); /* mighty_lb */
 
   //Delete adjacency
   lb_vip_del_adjacency(lbm, vip);
@@ -1427,32 +1437,202 @@ lb_fib_node_back_walk_notify (fib_node_t *node,
     return (FIB_NODE_BACK_WALK_CONTINUE);
 }
 
-/* mighty_lb: VIP ICMP echo — the addresses lb4-vip-echo answers for, and
- * the interfaces (the WAN) it runs on. */
-int
-lb_vip_echo_add_del (ip4_address_t *address, u8 is_add)
+/*
+ * mighty_lb: lb4-vip-dispatch — the (VIP, protocol, port) table that sends
+ * a VIP's packets straight to their service's node: an lb VIP's encap node
+ * (entries kept with the VIP, lb_vip_dispatch_lb), cnat's ip4-cnat-tx with
+ * the VIP's cnat client (added for each cnat translation), or the ICMP echo
+ * reply (protocol ICMP, port 0). A VIP's FIB entry leads to one DPO only —
+ * one lb encapsulation, and lb or cnat — so this is what lets one VIP
+ * address carry services of every mode.
+ */
+
+/* cnat_plugin.so's exports (plugins are dlopen()ed without RTLD_GLOBAL,
+ * so they are looked up by name), resolved with the first cnat entry */
+typedef u32 (*lb_cnat_client_index_fn_t) (const ip4_address_t *ip,
+                                          u32 fib_index);
+typedef void (*lb_cnat_client_del_cb_t) (u32 cci);
+typedef void (*lb_cnat_client_register_del_cb_fn_t) (
+  lb_cnat_client_del_cb_t cb);
+static lb_cnat_client_index_fn_t lb_cnat_client_index;
+
+static int
+lb_vip_dispatch_set (u64 key, u64 value, u8 is_add)
 {
   lb_main_t *lbm = &lb_main;
-  clib_bihash_kv_8_8_t kv = { .key = address->as_u32, .value = 0 }, v;
-  int found = (clib_bihash_search_8_8 (&lbm->vip_echo, &kv, &v) == 0);
+  clib_bihash_kv_8_8_t kv = { .key = key, .value = value }, v;
+  int found = (clib_bihash_search_8_8 (&lbm->vip_dispatch, &kv, &v) == 0);
 
   if (is_add)
     {
-      if (found)
-        return 0;
-      clib_bihash_add_del_8_8 (&lbm->vip_echo, &kv, 1);
-      lbm->n_vip_echo++;
+      clib_bihash_add_del_8_8 (&lbm->vip_dispatch, &kv, 1);
+      if (!found)
+        lbm->n_vip_dispatch++;
       return 0;
     }
   if (!found)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
-  clib_bihash_add_del_8_8 (&lbm->vip_echo, &kv, 0);
-  lbm->n_vip_echo--;
+  clib_bihash_add_del_8_8 (&lbm->vip_dispatch, &kv, 0);
+  lbm->n_vip_dispatch--;
+  return 0;
+}
+
+/* the entry kind owns: another kind's entry is left alone (the lb VIP
+ * taking a port over from a cnat translation replaces its entry, and that
+ * translation's removal must not take the VIP's away) */
+static int
+lb_vip_dispatch_del_kind (u64 key, u8 kind)
+{
+  lb_main_t *lbm = &lb_main;
+  clib_bihash_kv_8_8_t kv = { .key = key }, v;
+
+  if (clib_bihash_search_8_8 (&lbm->vip_dispatch, &kv, &v) != 0 ||
+      lb_vip_dispatch_value_kind (v.value) != kind)
+    return VNET_API_ERROR_NO_SUCH_ENTRY;
+  return lb_vip_dispatch_set (key, 0, 0);
+}
+
+/* an IPv4 per-port lb VIP's entry, kept with the VIP (lb_vip_add/del):
+ * its type's per-port node with the prefix index (lb_as_stack stacks the
+ * ASs' DPOs for that node, so not the all-port one) */
+static void
+lb_vip_dispatch_lb (lb_vip_t *vip, u8 is_add)
+{
+  u32 next;
+  u64 key;
+
+  if (!lb_vip_is_ip4 (vip->type) || vip->port == 0 || vip->plen != 128)
+    return;
+  switch (lb_vip_encap_type (vip))
+    {
+    case LB_ENCAP_TYPE_GRE4:
+      next = LB_VIP_DISPATCH_NEXT_GRE4;
+      break;
+    case LB_ENCAP_TYPE_IPIP4:
+      next = LB_VIP_DISPATCH_NEXT_IPIP4;
+      break;
+    case LB_ENCAP_TYPE_L3DSR:
+      next = LB_VIP_DISPATCH_NEXT_L3DSR;
+      break;
+    case LB_ENCAP_TYPE_L2DSR:
+      next = LB_VIP_DISPATCH_NEXT_L2DSR;
+      break;
+    default:
+      return; /* GRE6/NAT4: the FIB path as before */
+    }
+  key = lb_vip_dispatch_key (vip->prefix.ip4.as_u32, vip->protocol,
+                             vip->port);
+  if (is_add)
+    lb_vip_dispatch_set (key,
+                         lb_vip_dispatch_value (LB_VIP_DISPATCH_KIND_LB, next,
+                                                vip->vip_prefix_index),
+                         1);
+  else
+    lb_vip_dispatch_del_kind (key, LB_VIP_DISPATCH_KIND_LB);
+}
+
+/* cnat freed client cci: its entries go (no index may outlive it) */
+typedef struct
+{
+  u32 cci;
+  u64 *keys;
+} lb_vip_dispatch_walk_t;
+
+static int
+lb_vip_dispatch_cnat_walk (clib_bihash_kv_8_8_t *kv, void *arg)
+{
+  lb_vip_dispatch_walk_t *w = arg;
+  if (lb_vip_dispatch_value_kind (kv->value) == LB_VIP_DISPATCH_KIND_CNAT &&
+      lb_vip_dispatch_value_index (kv->value) == w->cci)
+    vec_add1 (w->keys, kv->key);
+  return BIHASH_WALK_CONTINUE;
+}
+
+static void
+lb_vip_dispatch_cnat_client_del (u32 cci)
+{
+  lb_main_t *lbm = &lb_main;
+  lb_vip_dispatch_walk_t w = { .cci = cci };
+  u64 *k;
+
+  clib_bihash_foreach_key_value_pair_8_8 (&lbm->vip_dispatch,
+                                          lb_vip_dispatch_cnat_walk, &w);
+  vec_foreach (k, w.keys)
+    lb_vip_dispatch_set (*k, 0, 0);
+  vec_free (w.keys);
+}
+
+static int
+lb_vip_dispatch_cnat_init (void)
+{
+  lb_main_t *lbm = &lb_main;
+  lb_cnat_client_register_del_cb_fn_t reg;
+
+  if (lb_cnat_client_index)
+    return 0;
+  lb_cnat_client_index = vlib_get_plugin_symbol (
+    "cnat_plugin.so", "cnat_client_ip4_index");
+  reg = vlib_get_plugin_symbol ("cnat_plugin.so",
+                                "cnat_client_register_del_cb");
+  if (!lb_cnat_client_index || !reg)
+    {
+      lb_cnat_client_index = 0;
+      return VNET_API_ERROR_UNSUPPORTED;
+    }
+  reg (lb_vip_dispatch_cnat_client_del);
+  lbm->vip_dispatch_cnat_next = vlib_node_add_named_next (
+    vlib_get_main (), lb4_vip_dispatch_node.index, "ip4-cnat-tx");
   return 0;
 }
 
 int
-lb_vip_echo_enable_disable (u32 sw_if_index, u8 enable)
+lb_vip_dispatch_add_del (ip4_address_t *address, u8 protocol, u16 port,
+                         lb_vip_dispatch_kind_t kind, u8 is_add)
+{
+  lb_main_t *lbm = &lb_main;
+  clib_bihash_kv_8_8_t kv, v;
+  u64 key;
+  u32 cci;
+  int rv;
+
+  switch (kind)
+    {
+    case LB_VIP_DISPATCH_KIND_ECHO:
+      key = lb_vip_dispatch_key (address->as_u32, IP_PROTOCOL_ICMP, 0);
+      if (!is_add)
+        return lb_vip_dispatch_del_kind (key, kind);
+      return lb_vip_dispatch_set (
+        key, lb_vip_dispatch_value (kind, LB_VIP_DISPATCH_NEXT_LOOKUP, 0), 1);
+
+    case LB_VIP_DISPATCH_KIND_CNAT:
+      if ((protocol != IP_PROTOCOL_TCP && protocol != IP_PROTOCOL_UDP) ||
+          port == 0)
+        return VNET_API_ERROR_INVALID_VALUE;
+      key = lb_vip_dispatch_key (address->as_u32, protocol, port);
+      if (!is_add)
+        return lb_vip_dispatch_del_kind (key, kind);
+      if ((rv = lb_vip_dispatch_cnat_init ()))
+        return rv;
+      /* the translation comes first: it holds the VIP's client */
+      cci = lb_cnat_client_index (address, 0);
+      if (cci == ~0)
+        return VNET_API_ERROR_NO_SUCH_ENTRY;
+      kv.key = key;
+      if (clib_bihash_search_8_8 (&lbm->vip_dispatch, &kv, &v) == 0 &&
+          lb_vip_dispatch_value_kind (v.value) == LB_VIP_DISPATCH_KIND_LB)
+        return VNET_API_ERROR_VALUE_EXIST; /* an lb VIP has the port */
+      return lb_vip_dispatch_set (
+        key, lb_vip_dispatch_value (kind, lbm->vip_dispatch_cnat_next, cci),
+        1);
+
+    default:
+      /* lb entries come and go with the lb VIPs */
+      return VNET_API_ERROR_INVALID_VALUE;
+    }
+}
+
+int
+lb_vip_dispatch_enable_disable (u32 sw_if_index, u8 enable)
 {
   /* idempotent: a vnet feature enabled twice runs twice */
   static uword *enabled;
@@ -1460,7 +1640,7 @@ lb_vip_echo_enable_disable (u32 sw_if_index, u8 enable)
   if (clib_bitmap_get (enabled, sw_if_index) == enable)
     return 0;
   enabled = clib_bitmap_set (enabled, sw_if_index, enable);
-  return vnet_feature_enable_disable ("ip4-unicast", "lb4-vip-echo",
+  return vnet_feature_enable_disable ("ip4-unicast", "lb4-vip-dispatch",
                                       sw_if_index, enable, 0, 0);
 }
 
@@ -1598,9 +1778,10 @@ lb_init (vlib_main_t * vm)
                         "mapping_by_as6", LB_MAPPING_BUCKETS,
                         LB_MAPPING_MEMORY_SIZE);
 
-  clib_bihash_init_8_8 (&lbm->vip_echo, "lb vip echo", LB_VIP_ECHO_BUCKETS,
-                        LB_VIP_ECHO_MEMORY_SIZE);
-  lbm->n_vip_echo = 0;
+  clib_bihash_init_8_8 (&lbm->vip_dispatch, "lb vip dispatch",
+                        LB_VIP_DISPATCH_BUCKETS, LB_VIP_DISPATCH_MEMORY_SIZE);
+  lbm->n_vip_dispatch = 0;
+  lbm->vip_dispatch_cnat_next = ~0;
 
 #define _(a,b,c) lbm->vip_counters[c].name = b;
   lb_foreach_vip_counter

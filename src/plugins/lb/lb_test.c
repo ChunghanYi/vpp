@@ -563,15 +563,26 @@ vl_api_lb_as_v2_details_t_handler (vl_api_lb_as_v2_details_t *mp)
 }
 
 static int
-api_lb_vip_echo_add_del (vat_main_t *vam)
+api_lb_vip_dispatch_add_del (vat_main_t *vam)
 {
   return -99;
 }
 
 static int
-api_lb_vip_echo_enable_disable (vat_main_t *vam)
+api_lb_vip_dispatch_enable_disable (vat_main_t *vam)
 {
   return -99;
+}
+
+static int
+api_lb_vip_dispatch_dump (vat_main_t *vam)
+{
+  return -99;
+}
+
+static void
+vl_api_lb_vip_dispatch_details_t_handler (vl_api_lb_vip_dispatch_details_t *mp)
+{
 }
 
 #include <lb/lb.api_test.c>

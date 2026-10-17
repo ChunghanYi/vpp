@@ -545,30 +545,71 @@ vl_api_lb_as_v2_dump_t_handler (vl_api_lb_as_v2_dump_t *mp)
 }
 
 static void
-vl_api_lb_vip_echo_add_del_t_handler (vl_api_lb_vip_echo_add_del_t *mp)
+vl_api_lb_vip_dispatch_add_del_t_handler (vl_api_lb_vip_dispatch_add_del_t *mp)
 {
   lb_main_t *lbm = &lb_main;
-  vl_api_lb_vip_echo_add_del_reply_t *rmp;
+  vl_api_lb_vip_dispatch_add_del_reply_t *rmp;
   ip4_address_t addr;
   int rv;
 
   ip4_address_decode (mp->address, &addr);
-  rv = lb_vip_echo_add_del (&addr, mp->is_add);
-  REPLY_MACRO (VL_API_LB_VIP_ECHO_ADD_DEL_REPLY);
+  rv = lb_vip_dispatch_add_del (&addr, mp->protocol, ntohs (mp->port),
+                                mp->kind, mp->is_add);
+  REPLY_MACRO (VL_API_LB_VIP_DISPATCH_ADD_DEL_REPLY);
 }
 
 static void
-vl_api_lb_vip_echo_enable_disable_t_handler (
-  vl_api_lb_vip_echo_enable_disable_t *mp)
+vl_api_lb_vip_dispatch_enable_disable_t_handler (
+  vl_api_lb_vip_dispatch_enable_disable_t *mp)
 {
   lb_main_t *lbm = &lb_main;
-  vl_api_lb_vip_echo_enable_disable_reply_t *rmp;
+  vl_api_lb_vip_dispatch_enable_disable_reply_t *rmp;
   int rv = 0;
 
   VALIDATE_SW_IF_INDEX (mp);
-  rv = lb_vip_echo_enable_disable (ntohl (mp->sw_if_index), mp->enable);
+  rv = lb_vip_dispatch_enable_disable (ntohl (mp->sw_if_index), mp->enable);
   BAD_SW_IF_INDEX_LABEL;
-  REPLY_MACRO (VL_API_LB_VIP_ECHO_ENABLE_DISABLE_REPLY);
+  REPLY_MACRO (VL_API_LB_VIP_DISPATCH_ENABLE_DISABLE_REPLY);
+}
+
+typedef struct
+{
+  vl_api_registration_t *reg;
+  u32 context;
+} lb_vip_dispatch_dump_ctx_t;
+
+static int
+lb_vip_dispatch_send_details (clib_bihash_kv_8_8_t *kv, void *arg)
+{
+  lb_main_t *lbm = &lb_main;
+  lb_vip_dispatch_dump_ctx_t *ctx = arg;
+  vl_api_lb_vip_dispatch_details_t *rmp;
+  ip4_address_t addr = { .as_u32 = (u32) (kv->key >> 32) };
+
+  rmp = vl_msg_api_alloc (sizeof (*rmp));
+  clib_memset (rmp, 0, sizeof (*rmp));
+  rmp->_vl_msg_id = htons (VL_API_LB_VIP_DISPATCH_DETAILS + lbm->msg_id_base);
+  rmp->context = ctx->context;
+  ip4_address_encode (&addr, rmp->address);
+  rmp->protocol = (u8) (kv->key >> 16);
+  rmp->port = htons ((u16) kv->key);
+  rmp->kind = lb_vip_dispatch_value_kind (kv->value);
+  rmp->index = htonl (lb_vip_dispatch_value_index (kv->value));
+  vl_api_send_msg (ctx->reg, (u8 *) rmp);
+  return BIHASH_WALK_CONTINUE;
+}
+
+static void
+vl_api_lb_vip_dispatch_dump_t_handler (vl_api_lb_vip_dispatch_dump_t *mp)
+{
+  lb_main_t *lbm = &lb_main;
+  lb_vip_dispatch_dump_ctx_t ctx = { .context = mp->context };
+
+  ctx.reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!ctx.reg)
+    return;
+  clib_bihash_foreach_key_value_pair_8_8 (&lbm->vip_dispatch,
+                                          lb_vip_dispatch_send_details, &ctx);
 }
 
 #include <lb/lb.api.c>

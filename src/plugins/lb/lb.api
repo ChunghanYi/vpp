@@ -277,19 +277,44 @@ define lb_as_v2_details {
   u64 new_flows;
 };
 
-/** \brief Answer (or stop answering) ICMP echo requests to a VIP address
-    on the interfaces lb_vip_echo_enable_disable turned on.
+/** \brief mighty_lb: add or remove an lb4-vip-dispatch entry.
+    kind 2 = cnat: (address, protocol tcp/udp, port) goes to cnat's VIP node
+             with the address's cnat client (add it after the translation);
+    kind 3 = echo: ICMP echo requests to address are answered (protocol and
+             port ignored).
+    The lb VIPs' entries (kind 1) come and go with the VIPs themselves.
 */
-autoreply define lb_vip_echo_add_del {
+autoreply define lb_vip_dispatch_add_del {
   u32 client_index;
   u32 context;
   vl_api_ip4_address_t address;
+  u8 protocol;
+  u16 port;
+  u8 kind;
   bool is_add;
 };
 
-autoreply define lb_vip_echo_enable_disable {
+/** \brief mighty_lb: run lb4-vip-dispatch on an interface (ip4-unicast). */
+autoreply define lb_vip_dispatch_enable_disable {
   u32 client_index;
   u32 context;
   vl_api_interface_index_t sw_if_index;
   bool enable;
+};
+
+/** \brief mighty_lb: dump the lb4-vip-dispatch entries.
+    index = the lb VIP prefix index (kind 1) or the cnat client index (kind 2).
+*/
+define lb_vip_dispatch_dump {
+  u32 client_index;
+  u32 context;
+};
+
+define lb_vip_dispatch_details {
+  u32 context;
+  vl_api_ip4_address_t address;
+  u8 protocol;
+  u16 port;
+  u8 kind;
+  u32 index;
 };

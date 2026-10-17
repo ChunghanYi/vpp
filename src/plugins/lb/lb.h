@@ -41,9 +41,10 @@
 #define LB_VIP_PER_PORT_BUCKETS  1024
 #define LB_VIP_PER_PORT_MEMORY_SIZE  64<<20
 
-/* mighty_lb: VIP ICMP echo address table (a few hundred VIPs at most) */
-#define LB_VIP_ECHO_BUCKETS      256
-#define LB_VIP_ECHO_MEMORY_SIZE  (1<<20)
+/* mighty_lb: VIP dispatch table — one entry per (VIP, protocol, port)
+ * service plus one per VIP answering ping (a few thousand at most) */
+#define LB_VIP_DISPATCH_BUCKETS      1024
+#define LB_VIP_DISPATCH_MEMORY_SIZE  (8<<20)
 
 typedef enum {
   LB_NEXT_DROP,
@@ -437,6 +438,35 @@ lb_vip_is_nat6_port(const lb_vip_t *vip)
   return (vip->type == LB_VIP_TYPE_IP6_NAT6 && vip->port != 0);
 }
 
+/* mighty_lb: the encapsulation a VIP of this type takes — the per-port
+ * VIPs of one prefix may differ (lb4-vip-dispatch), while the prefix's
+ * FIB entry leads to one encap node. */
+always_inline lb_encap_type_t
+lb_vip_encap_type (const lb_vip_t *vip)
+{
+  switch (vip->type)
+    {
+    case LB_VIP_TYPE_IP6_GRE6:
+    case LB_VIP_TYPE_IP4_GRE6:
+      return LB_ENCAP_TYPE_GRE6;
+    case LB_VIP_TYPE_IP6_GRE4:
+    case LB_VIP_TYPE_IP4_GRE4:
+      return LB_ENCAP_TYPE_GRE4;
+    case LB_VIP_TYPE_IP4_L3DSR:
+      return LB_ENCAP_TYPE_L3DSR;
+    case LB_VIP_TYPE_IP4_NAT4:
+      return LB_ENCAP_TYPE_NAT4;
+    case LB_VIP_TYPE_IP6_NAT6:
+      return LB_ENCAP_TYPE_NAT6;
+    case LB_VIP_TYPE_IP4_IPIP4:
+      return LB_ENCAP_TYPE_IPIP4;
+    case LB_VIP_TYPE_IP4_L2DSR:
+      return LB_ENCAP_TYPE_L2DSR;
+    default:
+      return LB_ENCAP_N_TYPES;
+    }
+}
+
 format_function_t format_lb_vip;
 format_function_t format_lb_vip_detailed;
 
@@ -591,12 +621,18 @@ typedef struct {
   vlib_simple_counter_main_t as_new_flows;
 
   /**
-   * mighty_lb: VIP addresses (IPv4, host key = as_u32) the lb4-vip-echo
-   * feature answers ICMP echo requests for — lb and cnat VIPs alike,
-   * since their FIB entries take every packet to the VIP otherwise.
+   * mighty_lb: the lb4-vip-dispatch table (lb_vip_dispatch_key/value):
+   * (IPv4 VIP, protocol, port) -> the lb per-port encap node and the
+ * VIP's prefix index, or
+   * cnat's VIP node and client index, or ICMP echo (protocol ICMP, port
+   * 0). It lets one VIP address carry lb and cnat services of any
+   * encapsulation, which its single FIB entry cannot.
    */
-  clib_bihash_8_8_t vip_echo;
-  u32 n_vip_echo;
+  clib_bihash_8_8_t vip_dispatch;
+  u32 n_vip_dispatch;
+  /* lb4-vip-dispatch's next node to cnat's ip4-cnat-tx, added with the
+   * first cnat entry (~0 until then) */
+  u32 vip_dispatch_cnat_next;
 
   /**
    * DPO used to send packet from IP4/6 lookup to LB node.
@@ -694,10 +730,42 @@ void lb_garbage_collection();
 
 int lb_nat4_interface_add_del (u32 sw_if_index, int is_del);
 
-/* mighty_lb: VIP ICMP echo (lb4-vip-echo feature) */
-int lb_vip_echo_add_del (ip4_address_t *address, u8 is_add);
-int lb_vip_echo_enable_disable (u32 sw_if_index, u8 enable);
-extern vlib_node_registration_t lb4_vip_echo_node;
+/* mighty_lb: VIP dispatch (lb4-vip-dispatch feature) */
+typedef enum
+{
+  LB_VIP_DISPATCH_KIND_LB = 1,	 /* lb VIP (added with the VIP itself) */
+  LB_VIP_DISPATCH_KIND_CNAT = 2, /* cnat translation's client */
+  LB_VIP_DISPATCH_KIND_ECHO = 3, /* answer ICMP echo (port 0) */
+} lb_vip_dispatch_kind_t;
+
+typedef enum
+{
+  LB_VIP_DISPATCH_NEXT_LOOKUP,
+  LB_VIP_DISPATCH_NEXT_GRE4,
+  LB_VIP_DISPATCH_NEXT_IPIP4,
+  LB_VIP_DISPATCH_NEXT_L3DSR,
+  LB_VIP_DISPATCH_NEXT_L2DSR,
+  LB_VIP_DISPATCH_N_NEXT,
+} lb_vip_dispatch_next_t;
+
+/* key: VIP (network order) | protocol | port (host order) */
+static_always_inline u64
+lb_vip_dispatch_key (u32 vip_as_u32, u8 protocol, u16 port)
+{
+  return ((u64) vip_as_u32 << 32) | ((u64) protocol << 16) | port;
+}
+
+/* value: kind | next node | index (lb VIP prefix or cnat client) */
+#define lb_vip_dispatch_value(kind, next, index)                              \
+  (((u64) (kind) << 56) | ((u64) (next) << 32) | (u32) (index))
+#define lb_vip_dispatch_value_kind(v)  ((u8) ((v) >> 56))
+#define lb_vip_dispatch_value_next(v)  ((u16) ((v) >> 32))
+#define lb_vip_dispatch_value_index(v) ((u32) (v))
+
+int lb_vip_dispatch_add_del (ip4_address_t *address, u8 protocol, u16 port,
+                             lb_vip_dispatch_kind_t kind, u8 is_add);
+int lb_vip_dispatch_enable_disable (u32 sw_if_index, u8 enable);
+extern vlib_node_registration_t lb4_vip_dispatch_node;
 int lb_nat6_interface_add_del (u32 sw_if_index, int is_del);
 
 format_function_t format_lb_main;
