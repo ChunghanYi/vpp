@@ -304,11 +304,18 @@ typedef struct cnat_timestamp_t_
   /* Session refcount, can be 2 (session, rsession) */
   u8 ts_session_refcnt;
 
+  /* rewrites present (bit = direction + location), plus
+   * CNAT_TS_BM_ACTIVE_COUNTED */
   u8 ts_rw_bm;
   cnat_timestamp_rewrite_t cts_rewrites[VLIB_N_DIR * CNAT_N_LOCATIONS];
 
 } cnat_timestamp_t;
-STATIC_ASSERT (VLIB_N_DIR *CNAT_N_LOCATIONS <= 8, "Too many locations");
+STATIC_ASSERT (VLIB_N_DIR *CNAT_N_LOCATIONS <= 7, "Too many locations");
+
+/* mighty_lb: the flow is counted in cnat_path_active[ts_trk_index]
+ * (taken when it is freed). Kept in ts_rw_bm's unused top bit so the
+ * timestamp does not grow. */
+#define CNAT_TS_BM_ACTIVE_COUNTED (1 << 7)
 
 /* Create the first pool with 1 << CNAT_TS_BASE_SIZE elts */
 #define CNAT_TS_BASE_SIZE (8)

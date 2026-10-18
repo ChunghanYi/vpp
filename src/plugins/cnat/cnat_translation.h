@@ -16,6 +16,17 @@
 extern vlib_combined_counter_main_t cnat_translation_counters;
 extern vlib_combined_counter_main_t cnat_path_counters;  /* mighty_lb */
 extern vlib_simple_counter_main_t cnat_path_new_flows;   /* mighty_lb */
+extern vlib_simple_counter_main_t cnat_path_active;      /* mighty_lb */
+
+/* mighty_lb: a path's live flows. Taken on any thread (the scanner runs
+ * on the main thread), so only the sum over threads is meaningful: it
+ * wraps modulo 2^64 back to the count. */
+static_always_inline u32
+cnat_path_active_get (index_t trk_index)
+{
+  i64 n = (i64) vlib_get_simple_counter (&cnat_path_active, trk_index);
+  return n > 0 ? (u32) n : 0;
+}
 
 typedef enum cnat_translation_flag_t_
 {

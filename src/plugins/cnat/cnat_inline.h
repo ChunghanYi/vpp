@@ -8,6 +8,7 @@
 
 #include <cnat/cnat_session.h>
 #include <cnat/cnat_types.h>
+#include <cnat/cnat_translation.h>
 #include <cnat/cnat_bihash.h>
 #include "cnat_log.h"
 
@@ -165,6 +166,14 @@ cnat_timestamp_free (u32 index, bool is_v6)
       for (int i = 0; i < CNAT_N_LOCATIONS * VLIB_N_DIR; i++)
 	if (ts->ts_rw_bm & (1 << i))
 	  cnat_timestamp_rewrite_free (&ts->cts_rewrites[i]);
+
+      /* mighty_lb: the flow leaves its path's live count. It may have
+       * been counted on another thread, so this thread's counter can go
+       * below 0 (not vlib_decrement_simple_counter, which asserts): the
+       * sum is right, see cnat_path_active_get */
+      if (ts->ts_rw_bm & CNAT_TS_BM_ACTIVE_COUNTED)
+	vlib_increment_simple_counter (&cnat_path_active, vlib_get_thread_index (),
+				       ts->ts_trk_index, (u64) -1);
 
       cnat_timestamp_destroy (index, is_v6);
     }

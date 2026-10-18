@@ -495,6 +495,7 @@ cnat_path_stats_send_details (u32 cti, void *args)
       mp->packets = clib_host_to_net_u64 (c.packets);
       mp->bytes = clib_host_to_net_u64 (c.bytes);
       mp->new_flows = clib_host_to_net_u64 (vlib_get_simple_counter (&cnat_path_new_flows, *trk_index));
+      mp->active_flows = clib_host_to_net_u32 (cnat_path_active_get (*trk_index));
       vl_api_send_msg (ctx->rp, (u8 *) mp);
     }
   return (WALK_CONTINUE);

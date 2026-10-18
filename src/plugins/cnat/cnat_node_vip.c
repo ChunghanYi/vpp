@@ -116,6 +116,9 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
 
   /* mighty_lb: per path counters (new flow; packets counted by the node) */
   vlib_increment_simple_counter (&cnat_path_new_flows, vm->thread_index, ts->ts_trk_index, 1);
+  /* mighty_lb: live flows, until cnat_timestamp_free */
+  vlib_increment_simple_counter (&cnat_path_active, vm->thread_index, ts->ts_trk_index, 1);
+  ts->ts_rw_bm |= CNAT_TS_BM_ACTIVE_COUNTED;
 
   /* refcnt session in current client */
   cnat_client_cnt_session (cc);
@@ -204,7 +207,15 @@ cnat_vip_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b, 
 	     NULL;
     }
   else if (vnet_buffer2 (b)->session.state == CNAT_LOOKUP_IS_NEW)
-    rw = cnat_vip_feature_new_flow_inline (vm, b, af, ts, cc);
+    {
+      rw = cnat_vip_feature_new_flow_inline (vm, b, af, ts, cc);
+      /* mighty_lb: this node made the flow's return session itself — the
+       * egress interface's cnat features (writeback / output) must not
+       * take it as a new flow again: the writeback added the same return
+       * session a second time with one more refcount, so the timestamp
+       * was never freed (one leaked per flow until the pools ran out) */
+      vnet_buffer2 (b)->session.state = CNAT_LOOKUP_IS_DONE;
+    }
 
   /* mighty_lb: per path forward counters */
   if (rw && vnet_buffer2 (b)->session.state != CNAT_LOOKUP_IS_RETURN &&

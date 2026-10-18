@@ -38,6 +38,12 @@ vlib_simple_counter_main_t cnat_path_new_flows = {
   .name = "cnat-path-new-flows",
   .stat_segment_name = "/net/cnat-path-new-flows",
 };
+/* mighty_lb: per path live flows (+1 new flow, -1 timestamp freed) —
+ * see cnat_path_active_get */
+vlib_simple_counter_main_t cnat_path_active = {
+  .name = "cnat-path-active",
+  .stat_segment_name = "/net/cnat-path-active",
+};
 
 void
 cnat_translation_watch_addr (index_t cti, u64 opaque, cnat_endpoint_t * ep,
@@ -396,6 +402,10 @@ cnat_translation_update (cnat_endpoint_t *vip, ip_protocol_t proto,
       vlib_zero_combined_counter (&cnat_path_counters, trk - cnat_ep_trk_pool);
       vlib_validate_simple_counter (&cnat_path_new_flows, trk - cnat_ep_trk_pool);
       vlib_zero_simple_counter (&cnat_path_new_flows, trk - cnat_ep_trk_pool);
+      /* no flow still holds a freed trk (cnat_session_scan frees it two
+       * scans after its sessions), so its live count starts at 0 */
+      vlib_validate_simple_counter (&cnat_path_active, trk - cnat_ep_trk_pool);
+      vlib_zero_simple_counter (&cnat_path_active, trk - cnat_ep_trk_pool);
       clib_memcpy (&trk->ct_ep[VLIB_TX], &path->dst_ep, sizeof (trk->ct_ep[VLIB_TX]));
       clib_memcpy (&trk->ct_ep[VLIB_RX], &path->src_ep, sizeof (trk->ct_ep[VLIB_RX]));
       trk->ct_flags = path->ep_flags;
@@ -434,11 +444,12 @@ format_cnat_ep_trk (u8 * s, va_list * args)
 	      format_cnat_endpoint, &ck->ct_ep[VLIB_TX]);
   /* mighty_lb */
   vlib_get_combined_counter (&cnat_path_counters, ck - cnat_ep_trk_pool, &c);
-  s = format (s, " weight:%u%s%s pkts:%Lu bytes:%Lu new-flows:%Lu", ck->ct_weight,
+  s = format (s, " weight:%u%s%s pkts:%Lu bytes:%Lu new-flows:%Lu active:%u", ck->ct_weight,
 	      ck->ct_weight ? "" : "(draining)",
 	      (ck->ct_flags & CNAT_TRK_FLAG_SNAT_LOW_PORTS) ? " low-ports" : "",
 	      c.packets, c.bytes,
-	      vlib_get_simple_counter (&cnat_path_new_flows, ck - cnat_ep_trk_pool));
+	      vlib_get_simple_counter (&cnat_path_new_flows, ck - cnat_ep_trk_pool),
+	      cnat_path_active_get (ck - cnat_ep_trk_pool));
   s = format (s, "\n%Ufib-entry:%d", format_white_space, indent, ck->ct_fei);
   s = format (s, "\n%U%U",
 	      format_white_space, indent, format_dpo_id, &ck->ct_dpo, 6);

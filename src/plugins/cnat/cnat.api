@@ -279,7 +279,8 @@ autoreply define feature_cnat_enable_disable
  */
 
 /* mighty_lb: per path counters of every translation — forward packets and
-   bytes sent to the path and the new flows given to it */
+   bytes sent to the path, the new flows given to it and its live flows
+   (ended by idle timeout, TCP FIN / RST or purge) */
 define cnat_path_stats_dump
 {
   u32 client_index;
@@ -297,4 +298,5 @@ define cnat_path_stats_details
   u64 packets;
   u64 bytes;
   u64 new_flows;
+  u32 active_flows;
 };
