@@ -157,6 +157,12 @@ vl_api_cnat_translation_update_t_handler (vl_api_cnat_translation_update_t
     goto done;
 
   n_paths = clib_net_to_host_u32 (mp->translation.n_paths);
+  /* n_paths - 1 would wrap to ~0 and abort on the allocation */
+  if (n_paths == 0)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
   vec_validate (paths, n_paths - 1);
 
   for (pi = 0; pi < n_paths; pi++)
