@@ -166,7 +166,7 @@ cnat_snat_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b,
       goto trace;
     }
 
-  cnat_translation (b, af, rw, &ts->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
+  cnat_translation (b, af, rw, ts, cm->tcp_max_age, 0 /* iph_offset */);
 
   if (!is_client)
     cnat_set_rw_next_node (b, rw, next0);

@@ -134,6 +134,12 @@ typedef struct cnat_translation_t_
   index_t ct_cci;
 
   /**
+   * mighty_lb: clients of the paths' source NAT addresses, one
+   * translation reference each (cnat_translation_hold_snat_clients)
+   */
+  index_t *ct_snat_ccis;
+
+  /**
    * Own index (if copied for trace)
    */
   index_t ct_index;

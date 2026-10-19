@@ -193,10 +193,10 @@ cnat_input_feature_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t 
       rw[2] = cnat_input_feature_get_rw (vm, b[2], af, ts[2]);
       rw[3] = cnat_input_feature_get_rw (vm, b[3], af, ts[3]);
 
-      cnat_translation (b[0], af, rw[0], &ts[0]->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
-      cnat_translation (b[1], af, rw[1], &ts[1]->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
-      cnat_translation (b[2], af, rw[2], &ts[2]->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
-      cnat_translation (b[3], af, rw[3], &ts[3]->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
+      cnat_translation (b[0], af, rw[0], ts[0], cm->tcp_max_age, 0 /* iph_offset */);
+      cnat_translation (b[1], af, rw[1], ts[1], cm->tcp_max_age, 0 /* iph_offset */);
+      cnat_translation (b[2], af, rw[2], ts[2], cm->tcp_max_age, 0 /* iph_offset */);
+      cnat_translation (b[3], af, rw[3], ts[3], cm->tcp_max_age, 0 /* iph_offset */);
 
       cnat_set_rw_next_node (b[0], rw[0], &next[0]);
       cnat_set_rw_next_node (b[1], rw[1], &next[1]);
@@ -249,7 +249,7 @@ cnat_input_feature_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t 
       ts[0] = cnat_timestamp_get (b[0]->flow_id);
 
       rw[0] = cnat_input_feature_get_rw (vm, b[0], af, ts[0]);
-      cnat_translation (b[0], af, rw[0], &ts[0]->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
+      cnat_translation (b[0], af, rw[0], ts[0], cm->tcp_max_age, 0 /* iph_offset */);
       cnat_set_rw_next_node (b[0], rw[0], &next[0]);
 
       if (PREDICT_FALSE (do_trace))
@@ -467,13 +467,13 @@ cnat_output_feature_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t
       rw[2] = cnat_output_feature_get_rw (vm, b[2], af, ts[2]);
       rw[3] = cnat_output_feature_get_rw (vm, b[3], af, ts[3]);
 
-      cnat_translation (b[0], af, rw[0], &ts[0]->lifetime, cm->tcp_max_age,
+      cnat_translation (b[0], af, rw[0], ts[0], cm->tcp_max_age,
 			vnet_buffer (b[0])->ip.save_rewrite_length);
-      cnat_translation (b[1], af, rw[1], &ts[1]->lifetime, cm->tcp_max_age,
+      cnat_translation (b[1], af, rw[1], ts[1], cm->tcp_max_age,
 			vnet_buffer (b[1])->ip.save_rewrite_length);
-      cnat_translation (b[2], af, rw[2], &ts[2]->lifetime, cm->tcp_max_age,
+      cnat_translation (b[2], af, rw[2], ts[2], cm->tcp_max_age,
 			vnet_buffer (b[2])->ip.save_rewrite_length);
-      cnat_translation (b[3], af, rw[3], &ts[3]->lifetime, cm->tcp_max_age,
+      cnat_translation (b[3], af, rw[3], ts[3], cm->tcp_max_age,
 			vnet_buffer (b[3])->ip.save_rewrite_length);
 
       /* Prefetch next iteration. */
@@ -524,7 +524,7 @@ cnat_output_feature_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t
 
       ts[0] = cnat_timestamp_get (b[0]->flow_id);
       rw[0] = cnat_output_feature_get_rw (vm, b[0], af, ts[0]);
-      cnat_translation (b[0], af, rw[0], &ts[0]->lifetime, cm->tcp_max_age,
+      cnat_translation (b[0], af, rw[0], ts[0], cm->tcp_max_age,
 			vnet_buffer (b[0])->ip.save_rewrite_length);
 
       if (PREDICT_FALSE (do_trace))

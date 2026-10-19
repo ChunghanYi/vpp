@@ -25,7 +25,23 @@
 #define CNAT_DEFAULT_TCP_MAX_AGE 3600
 /* lifetime of TCP conn NAT sessions after RST/FIN (seconds) */
 #define CNAT_DEFAULT_TCP_RST_TIMEOUT 5
+/* mighty_lb: lifetime of a TCP conn NAT session between the SYNACK and the
+ * client's ACK completing the handshake (seconds) — tcp-max-age only once
+ * the handshake completes, see cnat_tcp_update_session_lifetime */
+#define CNAT_DEFAULT_TCP_HALF_OPEN_AGE 5
+/* mighty_lb: lifetime of a UDP VIP session until the first reply from the
+ * real server (seconds) — session-max-age from then on; 0 = upstream
+ * (session-max-age from the first packet) */
+#define CNAT_DEFAULT_UDP_UNREPLIED_AGE 0
 #define CNAT_DEFAULT_SCANNER_TIMEOUT (1.0)
+/* mighty_lb: session scanner work per run (seconds) — upstream's fixed
+ * 100us, and, while a run frees at least CNAT_SCANNER_BURST_MIN_FREED
+ * sessions (a backlog of expired ones, e.g. after a flood), that plus
+ * session-cleanup-burst-pct percent of the scanner period for the next run
+ * (cnat_scanner_process) */
+#define CNAT_SCANNER_BUDGET		 (100e-6)
+#define CNAT_SCANNER_BURST_MIN_FREED	 16
+#define CNAT_DEFAULT_SCANNER_BURST_PCT 0
 /* max number of port retries when in use during reverse session creation */
 #define CNAT_DEFAULT_SESSION_MAX_PORT_RETRIES 100
 
@@ -192,12 +208,24 @@ typedef struct cnat_main_
    * session (in seconds) */
   u32 tcp_max_age;
 
+  /* mighty_lb: timeout of a TCP session whose handshake is not complete
+   * yet — SYNACK seen, client's ACK not (in seconds) */
+  u32 tcp_half_open_age;
+
+  /* mighty_lb: timeout of a UDP VIP session no reply has come back on
+   * yet, 0 = off (in seconds) */
+  u32 udp_unreplied_age;
+
   /* Maximum number of retries when port is in use
    * during reverse session creation */
   u32 session_max_port_retries;
 
   /* delay in seconds between two scans of session/clients tables */
   f64 scanner_timeout;
+
+  /* mighty_lb: extra scanner work while expired sessions pile up, in
+   * percent of scanner_timeout (see CNAT_SCANNER_BUDGET) */
+  u32 scanner_burst_pct;
 
   /* Index of the scanner process node */
   uword scanner_node_index;
@@ -305,17 +333,27 @@ typedef struct cnat_timestamp_t_
   u8 ts_session_refcnt;
 
   /* rewrites present (bit = direction + location), plus
-   * CNAT_TS_BM_ACTIVE_COUNTED */
+   * CNAT_TS_BM_TCP_HALF_OPEN (or _UDP_UNREPLIED) and CNAT_TS_BM_ACTIVE_COUNTED */
   u8 ts_rw_bm;
   cnat_timestamp_rewrite_t cts_rewrites[VLIB_N_DIR * CNAT_N_LOCATIONS];
 
 } cnat_timestamp_t;
-STATIC_ASSERT (VLIB_N_DIR *CNAT_N_LOCATIONS <= 7, "Too many locations");
+/* mighty_lb: <= 6 — bits 6 and 7 of ts_rw_bm are flags (below) */
+STATIC_ASSERT (VLIB_N_DIR *CNAT_N_LOCATIONS <= 6, "Too many locations");
 
 /* mighty_lb: the flow is counted in cnat_path_active[ts_trk_index]
  * (taken when it is freed). Kept in ts_rw_bm's unused top bit so the
  * timestamp does not grow. */
 #define CNAT_TS_BM_ACTIVE_COUNTED (1 << 7)
+
+/* mighty_lb: TCP handshake in progress — the SYNACK was seen, the client's
+ * ACK not yet (cnat_tcp_update_session_lifetime). Kept in ts_rw_bm's other
+ * unused bit, like CNAT_TS_BM_ACTIVE_COUNTED. */
+#define CNAT_TS_BM_TCP_HALF_OPEN (1 << 6)
+
+/* mighty_lb: UDP VIP flow with no reply yet (udp-unreplied-age) — the same
+ * bit as CNAT_TS_BM_TCP_HALF_OPEN, the protocol tells them apart */
+#define CNAT_TS_BM_UDP_UNREPLIED CNAT_TS_BM_TCP_HALF_OPEN
 
 /* Create the first pool with 1 << CNAT_TS_BASE_SIZE elts */
 #define CNAT_TS_BASE_SIZE (8)

@@ -14,9 +14,11 @@
  *   floodguard flood share <workers>
  *   floodguard victim add <ip4> syn|udp|icmp [port <n>]
  *   floodguard victim add <ip4> syn-challenge
- *   floodguard victim del <ip4> syn|udp|icmp|syn-challenge
+ *   floodguard victim add <ip4> syn-guard
+ *   floodguard victim del <ip4> syn|udp|icmp|syn-challenge|syn-guard
  *   floodguard victim clear
  *   floodguard syn-challenge [whitelist-ttl <seconds>] [whitelist-size <n>]
+ *   floodguard syn-guard rate <pps> burst <packets> [hold <seconds>]
  *   show floodguard [victims]
  *
  * "enable" replaces the interface's whole Broadcast Filter configuration
@@ -38,6 +40,12 @@
  * limited); every victim armed for that type gets its own bucket with
  * that limit, split evenly over the workers polling the victim
  * interfaces' rx queues ("flood share", see floodguard_flood_share).
+ *
+ * mighty_lb: "syn-guard" (network mode l4) registers a load balancer VIP
+ * for the VIP SYN Guard (floodguard.h's FLOODGUARD_V_SYN_GUARD), and
+ * "syn-guard rate" sets the SYN rate per VIP it engages above (split over
+ * the workers like the flood limits; rate 0 = off) and how long it stays
+ * engaged after the rate last went over.
  */
 
 #include <sys/random.h>
@@ -139,9 +147,9 @@ floodguard_default_threads (void)
  * the workers test, so it is written last when a limit is set and first
  * when it is removed. */
 static void
-floodguard_flood_share (vlib_main_t *vm, floodguard_main_t *fm, int i)
+floodguard_limit_share (vlib_main_t *vm, floodguard_main_t *fm,
+			floodguard_flood_t *f)
 {
-  floodguard_flood_t *f = &fm->flood[i];
   u32 n = fm->n_share_threads;
   u64 rate, burst, tpt;
 
@@ -156,6 +164,12 @@ floodguard_flood_share (vlib_main_t *vm, floodguard_main_t *fm, int i)
   f->burst_per_thread = burst;
   f->fill_ticks = burst * tpt;
   f->ticks_per_token = tpt;
+}
+
+static void
+floodguard_flood_share (vlib_main_t *vm, floodguard_main_t *fm, int i)
+{
+  floodguard_limit_share (vm, fm, &fm->flood[i]);
 }
 
 /* floodguard_victim_free: release a victim record (CLI barrier). */
@@ -185,6 +199,8 @@ floodguard_victim_alloc (floodguard_main_t *fm)
 	vlib_validate_simple_counter (&fm->victim_counters[t][c], index);
 	vlib_zero_simple_counter (&fm->victim_counters[t][c], index);
       }
+  vlib_validate_simple_counter (&fm->syn_guard_engaged, index);
+  vlib_zero_simple_counter (&fm->syn_guard_engaged, index);
   return index;
 }
 
@@ -426,6 +442,8 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	clear = 1;
       else if (unformat (input, "syn-challenge"))
 	type = FLOODGUARD_N_FLOOD;
+      else if (unformat (input, "syn-guard"))
+	type = FLOODGUARD_N_FLOOD + 1;
       else if (unformat (input, "port %u", &port))
 	{
 	  if (port > 65535)
@@ -456,15 +474,19 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			    FLOODGUARD_VICTIM_BUCKETS,
 			    FLOODGUARD_VICTIM_MEMORY);
       fm->n_victims = 0;
+      fm->n_guard_only = 0;
       return 0;
     }
   if (is_add < 0 || type < 0)
     return clib_error_return (
-      0, "specify add|del <ip4> and syn|udp|icmp|syn-challenge");
-  if (type == FLOODGUARD_N_FLOOD)
+      0, "specify add|del <ip4> and syn|udp|icmp|syn-challenge|syn-guard");
+  if (type >= FLOODGUARD_N_FLOOD)
     {
       if (port)
-	return clib_error_return (0, "syn-challenge takes no port");
+	return clib_error_return (0, "%s takes no port",
+				  type == FLOODGUARD_N_FLOOD ? "syn-challenge" :
+							       "syn-guard");
+      /* the SYN Guard challenges too */
       if (is_add)
 	floodguard_challenge_tables (fm);
     }
@@ -494,10 +516,15 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (is_add)
 	v |= FLOODGUARD_V_ICMP;
       break;
-    default:
+    case FLOODGUARD_N_FLOOD:
       v &= ~FLOODGUARD_V_SYN_CHALLENGE;
       if (is_add)
 	v |= FLOODGUARD_V_SYN_CHALLENGE;
+      break;
+    default:
+      v &= ~FLOODGUARD_V_SYN_GUARD;
+      if (is_add)
+	v |= FLOODGUARD_V_SYN_GUARD;
     }
   if (v & FLOODGUARD_V_ANY)
     {
@@ -517,6 +544,19 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  vec_foreach (vt, fv->threads)
 	    clib_memset (&vt->bucket[type], 0, sizeof (vt->bucket[type]));
 	}
+      else if (type == FLOODGUARD_N_FLOOD + 1 &&
+	       !(was & FLOODGUARD_V_SYN_GUARD))
+	{
+	  /* Newly guarded: full bucket, not engaged. */
+	  floodguard_victim_t *fv =
+	    pool_elt_at_index (fm->victim_pool, FLOODGUARD_V_INDEX (v));
+	  floodguard_victim_thread_t *vt;
+	  vec_foreach (vt, fv->threads)
+	    {
+	      clib_memset (&vt->guard, 0, sizeof (vt->guard));
+	      vt->guard_until = 0;
+	    }
+	}
       kv.value = v;
       if (clib_bihash_add_del_8_8 (&fm->victims, &kv, 1))
 	{
@@ -533,6 +573,11 @@ floodguard_victim_command_fn (vlib_main_t *vm, unformat_input_t *input,
       floodguard_victim_free (fm, FLOODGUARD_V_INDEX (v));
       fm->n_victims--;
     }
+  /* n_guard_only follows this entry's change (was/v: before/after) */
+  if (exists && (was & FLOODGUARD_V_ANY) == FLOODGUARD_V_SYN_GUARD)
+    fm->n_guard_only--;
+  if ((v & FLOODGUARD_V_ANY) == FLOODGUARD_V_SYN_GUARD)
+    fm->n_guard_only++;
   return 0;
 }
 
@@ -554,6 +599,7 @@ floodguard_flood_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  fm->n_share_threads = share;
 	  for (i = 0; i < FLOODGUARD_N_FLOOD; i++)
 	    floodguard_flood_share (vm, fm, i);
+	  floodguard_limit_share (vm, fm, &fm->syn_guard);
 	}
       return 0;
     }
@@ -586,6 +632,41 @@ floodguard_flood_command_fn (vlib_main_t *vm, unformat_input_t *input,
   fm->flood[type].rate_pps = rate;
   fm->flood[type].burst = burst;
   floodguard_flood_share (vm, fm, type);
+  return 0;
+}
+
+/* mighty_lb: "floodguard syn-guard rate <pps> burst <packets> [hold <s>]" */
+static clib_error_t *
+floodguard_syn_guard_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				 vlib_cli_command_t *cmd)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u32 rate = ~0, burst = ~0, hold = fm->syn_guard_hold_sec;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "rate %u", &rate))
+	;
+      else if (unformat (input, "burst %u", &burst))
+	;
+      else if (unformat (input, "hold %u", &hold))
+	;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+  if (rate == ~0 || burst == ~0)
+    return clib_error_return (0, "specify rate <pps> burst <packets>");
+  if (rate && !burst)
+    return clib_error_return (0, "burst must be > 0");
+  if (!hold)
+    return clib_error_return (0, "hold must be > 0");
+
+  fm->syn_guard_hold_sec = hold;
+  fm->syn_guard_hold_ticks = (u64) hold * vm->clib_time.clocks_per_second;
+  fm->syn_guard.rate_pps = rate;
+  fm->syn_guard.burst = burst;
+  floodguard_limit_share (vm, fm, &fm->syn_guard);
   return 0;
 }
 
@@ -631,8 +712,25 @@ floodguard_show_victim (clib_bihash_kv_8_8_t *kv, void *arg)
     s = format (s, " icmp");
   if (v & FLOODGUARD_V_SYN_CHALLENGE)
     s = format (s, " syn-challenge");
+  if (v & FLOODGUARD_V_SYN_GUARD)
+    s = format (s, " syn-guard");
   vlib_cli_output (ctx->vm, "%v", s);
   vec_free (s);
+  /* virtserver parses this line (ddos/floodguard_vpp.go): engaged on any
+   * worker = active. */
+  if (v & FLOODGUARD_V_SYN_GUARD)
+    {
+      floodguard_victim_t *fv = pool_elt_at_index (fm->victim_pool, index);
+      floodguard_victim_thread_t *vt;
+      u64 now = clib_cpu_time_now ();
+      int active = 0;
+      vec_foreach (vt, fv->threads)
+	if (now < vt->guard_until)
+	  active = 1;
+      vlib_cli_output (ctx->vm, "    syn-guard %s engaged %llu",
+		       active ? "active" : "idle",
+		       vlib_get_simple_counter (&fm->syn_guard_engaged, index));
+    }
   /* virtserver parses these lines (ddos/floodguard_vpp.go). */
   for (t = 0; t < FLOODGUARD_N_FLOOD; t++)
     if (v & (floodguard_flood_bits[t] |
@@ -793,6 +891,12 @@ show_floodguard_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	vlib_cli_output (vm, "    %s: off, conform %llu, violate %llu",
 			 floodguard_flood_keywords[i], conform, violate);
     }
+  if (fm->syn_guard.rate_pps)
+    vlib_cli_output (vm, "  SYN Guard: rate %u pps per VIP, burst %u, hold %us",
+		     fm->syn_guard.rate_pps, fm->syn_guard.burst,
+		     fm->syn_guard_hold_sec);
+  else
+    vlib_cli_output (vm, "  SYN Guard: off");
   vlib_cli_output (vm, "  Drops:");
   for (i = FLOODGUARD_KIND_ARP; i < FLOODGUARD_N_KIND; i++)
     vlib_cli_output (vm, "    %-13s %llu", floodguard_drop_counter_names[i],
@@ -955,8 +1059,8 @@ VLIB_CLI_COMMAND (floodguard_interface_command, static) = {
 VLIB_CLI_COMMAND (floodguard_victim_command, static) = {
   .path = "floodguard victim",
   .short_help = "floodguard victim add <ip4> syn|udp|icmp [port <n>] | "
-		"floodguard victim add <ip4> syn-challenge | "
-		"floodguard victim del <ip4> syn|udp|icmp|syn-challenge | "
+		"floodguard victim add <ip4> syn-challenge|syn-guard | "
+		"floodguard victim del <ip4> syn|udp|icmp|syn-challenge|syn-guard | "
 		"floodguard victim clear",
   .function = floodguard_victim_command_fn,
 };
@@ -973,6 +1077,12 @@ VLIB_CLI_COMMAND (floodguard_challenge_command, static) = {
   .short_help = "floodguard syn-challenge [whitelist-ttl <seconds>] "
 		"[whitelist-size <n>]",
   .function = floodguard_challenge_command_fn,
+};
+
+VLIB_CLI_COMMAND (floodguard_syn_guard_command, static) = {
+  .path = "floodguard syn-guard",
+  .short_help = "floodguard syn-guard rate <pps> burst <packets> [hold <seconds>]",
+  .function = floodguard_syn_guard_command_fn,
 };
 
 VLIB_CLI_COMMAND (floodguard_wan_reply_command, static) = {
@@ -1037,6 +1147,11 @@ floodguard_init (vlib_main_t *vm)
   fm->challenge_whitelist_ttl_sec =
     FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_TTL_SEC;
   fm->challenge_whitelist_max = FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_MAX;
+  fm->syn_guard_hold_sec = FLOODGUARD_SYN_GUARD_DEFAULT_HOLD_SEC;
+  fm->syn_guard_hold_ticks =
+    (u64) fm->syn_guard_hold_sec * vm->clib_time.clocks_per_second;
+  fm->syn_guard_engaged.name = "syn-guard-engaged";
+  fm->syn_guard_engaged.stat_segment_name = "/floodguard/syn-guard/engaged";
 
   /* The challenge cookie key: a fresh random secret every start, never
    * shown. Without it the challenge is off (SYNs pass untouched) rather

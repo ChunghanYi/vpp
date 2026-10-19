@@ -35,6 +35,9 @@
 #define FLOODGUARD_CHALLENGE_COOKIE_SLOT_SEC 8
 /* Verified-client TTL until virtserver sets one (its own default). */
 #define FLOODGUARD_CHALLENGE_DEFAULT_WHITELIST_TTL_SEC 300
+/* mighty_lb: how long a VIP's SYN Guard stays engaged after its SYN rate
+ * last went over the limit, until virtserver sets one ("syn-guard ... hold"). */
+#define FLOODGUARD_SYN_GUARD_DEFAULT_HOLD_SEC 5
 
 /* What a packet was classified as — also the drop counter index. The
  * Broadcast Filter kinds are checked in the policer classify chain's own
@@ -69,9 +72,15 @@ typedef enum
 #define FLOODGUARD_V_UDP	   (1ULL << 33)
 #define FLOODGUARD_V_ICMP	   (1ULL << 34)
 #define FLOODGUARD_V_SYN_CHALLENGE (1ULL << 35)
+/* mighty_lb: VIP SYN Guard — a load balancer VIP, registered for as long as
+ * it exists: its SYNs pass untouched while under the syn-guard rate; over
+ * it, every unverified source's SYN gets the SYN Reset Challenge for
+ * syn_guard_hold_ticks (refreshed while still over), so a spoofed SYN flood
+ * creates no NAT session before the Detector even reports it. */
+#define FLOODGUARD_V_SYN_GUARD	   (1ULL << 36)
 #define FLOODGUARD_V_ANY                                                      \
   (FLOODGUARD_V_SYN | FLOODGUARD_V_UDP | FLOODGUARD_V_ICMP |                  \
-   FLOODGUARD_V_SYN_CHALLENGE)
+   FLOODGUARD_V_SYN_CHALLENGE | FLOODGUARD_V_SYN_GUARD)
 #define FLOODGUARD_V_SYN_PORT(v) ((u16) ((v) >> 16))
 #define FLOODGUARD_V_UDP_PORT(v) ((u16) (v))
 #define FLOODGUARD_V_INDEX_SHIFT 40
@@ -116,11 +125,15 @@ typedef struct
   u64 last_tick; /* clib_cpu_time_now () */
 } floodguard_bucket_t;
 
-/* One worker's buckets for one victim, a cache line of its own. */
+/* One worker's buckets for one victim, cache lines of its own. guard /
+ * guard_until: the VIP SYN Guard's rate bucket and when its engagement ends
+ * (clib_cpu_time_now (); 0 = not engaged). */
 typedef struct
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
   floodguard_bucket_t bucket[FLOODGUARD_N_FLOOD];
+  floodguard_bucket_t guard;
+  u64 guard_until;
 } floodguard_victim_thread_t;
 
 /* Victim record (floodguard_main_t.victim_pool): per-worker buckets,
@@ -169,10 +182,21 @@ typedef struct
 {
   floodguard_if_t *ifs; /* by sw_if_index */
 
-  /* Victim dst IPv4 (network order, zero-extended) -> FLOODGUARD_V_* value. */
+  /* Victim dst IPv4 (network order, zero-extended) -> FLOODGUARD_V_* value.
+   * n_guard_only: entries holding nothing but FLOODGUARD_V_SYN_GUARD — while
+   * every entry is one, the victim node looks up TCP SYN/RST packets only. */
   clib_bihash_8_8_t victims;
   u32 n_victims;
+  u32 n_guard_only;
   floodguard_victim_t *victim_pool;
+
+  /* mighty_lb: VIP SYN Guard rate ("floodguard syn-guard rate <pps> burst
+   * <n> [hold <s>]"; rate 0 = off), split over n_share_threads like the
+   * flood limits, and per victim the times it engaged (by pool index). */
+  floodguard_flood_t syn_guard;
+  u32 syn_guard_hold_sec;
+  u64 syn_guard_hold_ticks;
+  vlib_simple_counter_main_t syn_guard_engaged;
 
   /* Victim flood limits: SYN, UDP, ICMP. n_share_threads: the number of
    * shares each limit is split into — the workers polling the rx queues of

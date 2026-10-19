@@ -174,6 +174,14 @@ cnat_vip_feature_new_flow_inline (vlib_main_t *vm, vlib_buffer_t *b, ip_address_
 
       if (!probe_port)
 	cnat_rsession_create (rw, b->flow_id, CNAT_FIB_TABLE, do_snat /* add client */, 0, 0, 0);
+
+      /* mighty_lb: a UDP flow keeps a short lifetime until the real server
+       * answers (cnat_translation) — spoofed sources never get one */
+      if (iproto == IP_PROTOCOL_UDP && cm->udp_unreplied_age)
+	{
+	  ts->lifetime = cm->udp_unreplied_age;
+	  ts->ts_rw_bm |= CNAT_TS_BM_UDP_UNREPLIED;
+	}
     }
 
   return rw;
@@ -186,13 +194,18 @@ cnat_vip_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b, 
 {
   cnat_timestamp_rewrite_t *rw = NULL;
   cnat_main_t *cm = &cnat_main;
-  cnat_timestamp_t *ts;
+  cnat_timestamp_t *ts = NULL;
   cnat_client_t *cc;
 
   cc = cnat_client_get (vnet_buffer (b)->ip.adj_index[VLIB_TX]);
   /* By default dont translate & Follow the fib programming */
   vnet_buffer (b)->ip.adj_index[VLIB_TX] = cc->cc_parent.dpoi_index;
   *next0 = cc->cc_parent.dpoi_next_node;
+
+  /* mighty_lb: no session (table full, an ICMP error without one): flow_id
+   * 0 is not this packet's, leave that timestamp alone */
+  if (vnet_buffer2 (b)->session.state == CNAT_LOOKUP_IS_ERR)
+    goto trace;
 
   ts = cnat_timestamp_update (b->flow_id, now);
   if (vnet_buffer2 (b)->session.state == CNAT_LOOKUP_IS_OK)
@@ -223,9 +236,10 @@ cnat_vip_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b, 
     vlib_increment_combined_counter (&cnat_path_counters, vm->thread_index, ts->ts_trk_index, 1,
 				     vlib_buffer_length_in_chain (vm, b));
 
-  cnat_translation (b, af, rw, &ts->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
+  cnat_translation (b, af, rw, ts, cm->tcp_max_age, 0 /* iph_offset */);
   cnat_set_rw_next_node (b, rw, next0);
 
+trace:
   if (PREDICT_FALSE (do_trace))
     cnat_add_trace (vm, node, b, ts, rw);
 }
@@ -314,7 +328,7 @@ cnat_return_node_fn (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *
 	 &ts->cts_rewrites[CNAT_IS_RETURN + CNAT_LOCATION_FIB] :
 	 NULL;
 
-  cnat_translation (b, af, rw, &ts->lifetime, cm->tcp_max_age, 0 /* iph_offset */);
+  cnat_translation (b, af, rw, ts, cm->tcp_max_age, 0 /* iph_offset */);
   cnat_set_rw_next_node (b, rw, next0);
 
 trace:

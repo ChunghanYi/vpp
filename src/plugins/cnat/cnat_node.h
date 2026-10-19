@@ -86,22 +86,6 @@ cnat_add_trace (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b,
 }
 
 static_always_inline u8
-icmp_type_is_error_message (u8 icmp_type)
-{
-  switch (icmp_type)
-    {
-    case ICMP4_destination_unreachable:
-    case ICMP4_time_exceeded:
-    case ICMP4_parameter_problem:
-    case ICMP4_source_quench:
-    case ICMP4_redirect:
-    case ICMP4_alternate_host_address:
-      return 1;
-    }
-  return 0;
-}
-
-static_always_inline u8
 icmp_type_is_echo (u8 icmp_type)
 {
   switch (icmp_type)
@@ -120,19 +104,6 @@ icmp6_type_is_echo (u8 icmp_type)
     {
     case ICMP6_echo_request:
     case ICMP6_echo_reply:
-      return 1;
-    }
-  return 0;
-}
-
-static_always_inline u8
-icmp6_type_is_error_message (u8 icmp_type)
-{
-  switch (icmp_type)
-    {
-    case ICMP6_destination_unreachable:
-    case ICMP6_time_exceeded:
-    case ICMP6_parameter_problem:
       return 1;
     }
   return 0;
@@ -265,17 +236,39 @@ cnat_ip4_translate_l3 (ip4_header_t *ip4, ip4_address_t new_addr[VLIB_N_DIR], u3
   ip4->checksum = ip_csum_fold (csum);
 }
 
+/* mighty_lb: a SYNACK only gives the session tcp_half_open_age — the
+ * client's ACK completing the handshake gives it tcp_max_age. Upstream gave
+ * tcp_max_age on the SYNACK: a real server answers every spoofed SYN of a
+ * flood with one, so each of them held a session (and, Full-NAT, an SNAT
+ * port) for tcp_max_age although no client ever completed the handshake —
+ * seen live 2026-10-19, 1.5M such sessions at lifetime 900 kept a Full-NAT
+ * service out of ports for 15 minutes after the flood stopped. */
 static_always_inline void
-cnat_tcp_update_session_lifetime (tcp_header_t *tcp, u16 *lifetime, u16 tcp_max_age)
+cnat_tcp_update_session_lifetime (tcp_header_t *tcp, cnat_timestamp_t *ts, u16 tcp_max_age)
 {
-  if (PREDICT_FALSE (tcp_fin (tcp)))
-    *lifetime = CNAT_DEFAULT_TCP_RST_TIMEOUT;
+  if (PREDICT_FALSE (tcp_fin (tcp) || tcp_rst (tcp)))
+    {
+      ts->lifetime = CNAT_DEFAULT_TCP_RST_TIMEOUT;
+      ts->ts_rw_bm &= ~CNAT_TS_BM_TCP_HALF_OPEN;
+      return;
+    }
 
-  if (PREDICT_FALSE (tcp_rst (tcp)))
-    *lifetime = CNAT_DEFAULT_TCP_RST_TIMEOUT;
+  if (PREDICT_FALSE (tcp_syn (tcp)))
+    {
+      if (tcp_ack (tcp))
+	{
+	  ts->lifetime = cnat_main.tcp_half_open_age;
+	  ts->ts_rw_bm |= CNAT_TS_BM_TCP_HALF_OPEN;
+	}
+      return;
+    }
 
-  if (PREDICT_FALSE (tcp_syn (tcp) && tcp_ack (tcp)))
-    *lifetime = tcp_max_age;
+  /* the client's ACK after the SYNACK: handshake complete */
+  if (PREDICT_FALSE (ts->ts_rw_bm & CNAT_TS_BM_TCP_HALF_OPEN) && tcp_ack (tcp))
+    {
+      ts->lifetime = tcp_max_age;
+      ts->ts_rw_bm &= ~CNAT_TS_BM_TCP_HALF_OPEN;
+    }
 }
 
 static_always_inline void
@@ -400,7 +393,7 @@ cnat_translation_icmp4_error (ip4_header_t *outer_ip4, icmp46_header_t *icmp,
 
 static_always_inline void
 cnat_translation_ip4 (const cnat_5tuple_t *tuple, ip4_header_t *ip4, udp_header_t *udp,
-		      u16 *lifetime, u16 tcp_max_age, u32 oflags, cnat_cksum_diff_t *cksum,
+		      cnat_timestamp_t *ts, u16 tcp_max_age, u32 oflags, cnat_cksum_diff_t *cksum,
 		      u8 *cts_flags)
 {
   tcp_header_t *tcp = (tcp_header_t *) udp;
@@ -417,7 +410,7 @@ cnat_translation_ip4 (const cnat_5tuple_t *tuple, ip4_header_t *ip4, udp_header_
       cnat_ip4_translate_l4 (ip4, udp, &tcp->checksum, new_addr, new_port, oflags, &cksum->l4,
 			     cts_flags);
       cnat_ip4_translate_l3 (ip4, new_addr, oflags, &cksum->l3, cts_flags);
-      cnat_tcp_update_session_lifetime (tcp, lifetime, tcp_max_age);
+      cnat_tcp_update_session_lifetime (tcp, ts, tcp_max_age);
     }
   else if (ip4->protocol == IP_PROTOCOL_UDP)
     {
@@ -668,7 +661,7 @@ cnat_translation_icmp6_error (ip6_header_t *outer_ip6, icmp46_header_t *icmp,
 
 static_always_inline void
 cnat_translation_ip6 (const cnat_5tuple_t *tuple, ip6_header_t *ip6, udp_header_t *udp,
-		      u16 *lifetime, u16 tcp_max_age, u32 oflags)
+		      cnat_timestamp_t *ts, u16 tcp_max_age, u32 oflags)
 {
   tcp_header_t *tcp = (tcp_header_t *) udp;
   ip6_address_t new_addr[VLIB_N_DIR];
@@ -685,7 +678,7 @@ cnat_translation_ip6 (const cnat_5tuple_t *tuple, ip6_header_t *ip6, udp_header_
       cnat_ip6_translate_l4 (ip6, udp, &sum, new_addr, new_port, oflags);
       tcp->checksum = ip_csum_fold (sum);
       cnat_ip6_translate_l3 (ip6, new_addr);
-      cnat_tcp_update_session_lifetime (tcp, lifetime, tcp_max_age);
+      cnat_tcp_update_session_lifetime (tcp, ts, tcp_max_age);
     }
   else if (ip6->protocol == IP_PROTOCOL_UDP)
     {
@@ -1066,7 +1059,7 @@ cnat_set_rw_next_node (vlib_buffer_t *b, const cnat_timestamp_rewrite_t *rw, u16
 
 static_always_inline void
 cnat_translation (vlib_buffer_t *b, ip_address_family_t af, cnat_timestamp_rewrite_t *rw,
-		  u16 *lifetime, u16 tcp_max_age, u32 iph_offset)
+		  cnat_timestamp_t *ts, u16 tcp_max_age, u32 iph_offset)
 {
   ip4_header_t *ip4 = NULL;
   ip6_header_t *ip6 = NULL;
@@ -1074,6 +1067,20 @@ cnat_translation (vlib_buffer_t *b, ip_address_family_t af, cnat_timestamp_rewri
 
   if (PREDICT_FALSE (!rw))
     return;
+
+  /* mighty_lb: the real server's first UDP reply — the flow gets the
+   * ordinary lifetime (udp-unreplied-age, cnat_vip_feature_new_flow_inline) */
+  if (PREDICT_FALSE (ts->ts_rw_bm & CNAT_TS_BM_UDP_UNREPLIED) &&
+      vnet_buffer2 (b)->session.state == CNAT_LOOKUP_IS_RETURN)
+    {
+      u8 *iph = (u8 *) vlib_buffer_get_current (b) + iph_offset;
+      u8 proto = AF_IP4 == af ? ((ip4_header_t *) iph)->protocol : ((ip6_header_t *) iph)->protocol;
+      if (proto == IP_PROTOCOL_UDP)
+	{
+	  ts->lifetime = cnat_main.session_max_age;
+	  ts->ts_rw_bm &= ~CNAT_TS_BM_UDP_UNREPLIED;
+	}
+    }
 
   /* todo : we should pass rpaths as part of the api instead of a flag */
   if (PREDICT_FALSE (rw->cts_flags & CNAT_TS_RW_FLAG_NO_NAT))
@@ -1084,7 +1091,7 @@ cnat_translation (vlib_buffer_t *b, ip_address_family_t af, cnat_timestamp_rewri
       ip4 = (ip4_header_t *) ((u8 *) vlib_buffer_get_current (b) + iph_offset);
       udp0 = (udp_header_t *) (ip4 + 1);
       u8 cts_flags = rw->cts_flags;
-      cnat_translation_ip4 (&rw->tuple, ip4, udp0, lifetime, tcp_max_age, vnet_buffer (b)->oflags,
+      cnat_translation_ip4 (&rw->tuple, ip4, udp0, ts, tcp_max_age, vnet_buffer (b)->oflags,
 			    &rw->cksum, &cts_flags);
       rw->cts_flags = cts_flags;
     }
@@ -1092,7 +1099,7 @@ cnat_translation (vlib_buffer_t *b, ip_address_family_t af, cnat_timestamp_rewri
     {
       ip6 = (ip6_header_t *) ((u8 *) vlib_buffer_get_current (b) + iph_offset);
       udp0 = (udp_header_t *) (ip6 + 1);
-      cnat_translation_ip6 (&rw->tuple, ip6, udp0, lifetime, tcp_max_age, vnet_buffer (b)->oflags);
+      cnat_translation_ip6 (&rw->tuple, ip6, udp0, ts, tcp_max_age, vnet_buffer (b)->oflags);
     }
 }
 

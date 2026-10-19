@@ -399,9 +399,12 @@ cnat_session_is_stale (cnat_session_t *session, f64 start_time)
   return 0;
 }
 
+/* mighty_lb: budget is this run's work time (upstream: a fixed 100us);
+ * n_freed returns how many sessions it freed. */
 u64
-cnat_session_scan (vlib_main_t *vm, f64 start_time, int i)
+cnat_session_scan (vlib_main_t *vm, f64 start_time, int i, f64 budget, u32 *n_freed)
 {
+  *n_freed = 0;
   if (!i)
     {
       /* delete confirmed deleted backends from previous scan
@@ -431,8 +434,8 @@ cnat_session_scan (vlib_main_t *vm, f64 start_time, int i)
 
   for ( /* caller saves starting point */ ; i < h->nbuckets; i++)
     {
-      /* allow no more than 100us without a pause */
-      if ((vlib_time_now (vm) - start_time) > 10e-5)
+      /* allow no more than budget without a pause */
+      if ((vlib_time_now (vm) - start_time) > budget)
 	goto out;
 
       if (i < (h->nbuckets - 3))
@@ -469,6 +472,7 @@ cnat_session_scan (vlib_main_t *vm, f64 start_time, int i)
 		  /* this should be last as deleting the session memset it to
 		   * 0xff */
 		  cnat_session_free (session);
+		  (*n_freed)++;
 
 		  /*
 		   * Note: we may have just freed the bucket's backing

@@ -136,7 +136,7 @@ extern void cnat_session_walk (cnat_session_walk_cb_t cb, void *ctx);
 /**
  * Scan the session DB for expired sessions
  */
-extern u64 cnat_session_scan (vlib_main_t *vm, f64 start_time, int i);
+extern u64 cnat_session_scan (vlib_main_t *vm, f64 start_time, int i, f64 budget, u32 *n_freed);
 
 /**
  * Purge all the sessions

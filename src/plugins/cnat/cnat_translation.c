@@ -255,6 +255,37 @@ cnat_translation_stack (cnat_translation_t * ct)
   ct->flags |= CNAT_TR_FLAG_STACKED;
 }
 
+/*
+ * mighty_lb: keep a client (the FIB /32 that takes the replies to it) for
+ * each path's source NAT address for as long as the path exists. Learned
+ * from the dataplane instead (cnat_rsession_create_client: an RPC to the
+ * main thread, and freed with the address's last session), the first flow
+ * after an idle period had its reply arrive before the client — the reply
+ * went to the glean adjacency and was dropped, and the connection waited
+ * for the real server's SYN-ACK retransmission (1 s). New references are
+ * taken before the old ones go, so a kept address is never removed.
+ */
+static void
+cnat_translation_hold_snat_clients (cnat_translation_t *ct, int release_only)
+{
+  index_t *old = ct->ct_snat_ccis, *cci, *trk_index;
+
+  ct->ct_snat_ccis = NULL;
+  if (!release_only)
+    vec_foreach (trk_index, ct->ct_paths_indexes)
+      {
+	cnat_ep_trk_t *trk = &cnat_ep_trk_pool[*trk_index];
+	if (ip_address_is_zero (&trk->ct_ep[VLIB_RX].ce_ip))
+	  continue;
+	index_t c = cnat_client_add (&trk->ct_ep[VLIB_RX].ce_ip, CNAT_FIB_TABLE, 0 /* flags */);
+	cnat_client_translation_added (c);
+	vec_add1 (ct->ct_snat_ccis, c);
+      }
+  vec_foreach (cci, old)
+    cnat_client_translation_deleted (*cci, CNAT_FIB_TABLE);
+  vec_free (old);
+}
+
 int
 cnat_translation_delete (u32 id, u32 fib_index)
 {
@@ -280,6 +311,7 @@ cnat_translation_delete (u32 id, u32 fib_index)
 
   cnat_remove_translation_from_db (ct->ct_cci, &ct->ct_vip, ct->ct_proto);
   cnat_client_translation_deleted (ct->ct_cci, fib_index);
+  cnat_translation_hold_snat_clients (ct, 1);
   cnat_translation_unwatch_addr (id, CNAT_RESOLV_ADDR_ANY);
   pool_put (cnat_translation_pool, ct);
 
@@ -416,6 +448,7 @@ cnat_translation_update (cnat_endpoint_t *vip, ip_protocol_t proto,
       cnat_tracker_track (ct->ct_index, trk);
     }
   vec_free (new_paths_indexes);
+  cnat_translation_hold_snat_clients (ct, 0);
   cnat_translation_stack (ct);
 
   return (ct->ct_index);

@@ -29,6 +29,7 @@
  *   blocklist and WAN Service Port ACL already applied), IPv4 dst = armed
  *   victim:
  *     TCP SYN/RST, SYN Reset Challenge      -> challenge (see below)
+ *     TCP SYN/RST, VIP SYN Guard engaged    -> challenge (mighty_lb, below)
  *     TCP with SYN (port-limited or all)    -> victim's SYN limit
  *     UDP (port-limited or all)             -> victim's UDP limit
  *     ICMP                                  -> victim's ICMP limit
@@ -69,6 +70,17 @@
  * reply is sent straight to interface-output: it is the victim's answer on
  * the ingress port, not bridged traffic, so it must not create an output
  * ACL session per spoofed source.
+ *
+ * VIP SYN Guard (mighty_lb, network mode l4): a load balancer VIP is in the
+ * victim table for as long as it exists (FLOODGUARD_V_SYN_GUARD). Its bare
+ * SYNs pass untouched while each worker's share of the syn-guard rate
+ * holds; over it, the worker engages the guard for syn_guard_hold_ticks
+ * (refreshed while still over) and every SYN/RST toward the VIP goes
+ * through the SYN Reset Challenge — this node runs ahead of the load
+ * balancer, so a spoofed SYN flood creates no cnat session (nor Full-NAT
+ * SNAT port) from its first second, before the Detector reports it. While
+ * the table holds nothing but VIP entries, only TCP SYN/RST packets are
+ * looked up.
  *
  * Deliberate differences from the classify masks: the IPv4 header length
  * is honored (the masks assumed a 20-byte header, so IP options shifted
@@ -614,6 +626,8 @@ floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 n_dropped = 0, n_flood = 0;
   u32 thread = vm->thread_index;
   int check_victims = fm->n_victims != 0;
+  /* mighty_lb: only VIP SYN Guard entries — other packets need no lookup */
+  int guard_only = fm->n_victims == fm->n_guard_only;
   u64 now = clib_cpu_time_now ();
   u64 pnow = now >> POLICER_TICKS_PER_PERIOD_SHIFT;
 
@@ -668,6 +682,13 @@ floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (!check_victims || (u8 *) (ip + 1) > end)
 	goto done;
+      if (guard_only)
+	{
+	  tcp_header_t *t = (tcp_header_t *) ((u8 *) ip + ip4_header_bytes (ip));
+	  if (ip->protocol != IP_PROTOCOL_TCP || (u8 *) (t + 1) > end ||
+	      !(t->flags & (TCP_FLAG_SYN | TCP_FLAG_RST)))
+	    goto done;
+	}
       kv.key = ip->dst_address.as_u32;
       if (clib_bihash_search_8_8 (&fm->victims, &kv, &val))
 	goto done;
@@ -692,6 +713,29 @@ floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		verdict = floodguard_challenge (vm, fm, b[0], eth, ip, tcp,
 						is_syn);
 		break;
+	      }
+	    if (PREDICT_FALSE (v & FLOODGUARD_V_SYN_GUARD) &&
+		(is_syn || (flags & TCP_FLAG_RST)) &&
+		fm->syn_guard.ticks_per_token)
+	      {
+		u32 gi = FLOODGUARD_V_INDEX (v);
+		floodguard_victim_thread_t *gt =
+		  vec_elt_at_index (fm->victim_pool[gi].threads, thread);
+		if (is_syn && !floodguard_flood_allow (&gt->guard,
+						       &fm->syn_guard, now))
+		  {
+		    if (now >= gt->guard_until)
+		      vlib_increment_simple_counter (&fm->syn_guard_engaged,
+						     thread, gi, 1);
+		    gt->guard_until = now + fm->syn_guard_hold_ticks;
+		  }
+		if (now < gt->guard_until)
+		  {
+		    kind = FLOODGUARD_KIND_SYN_CHALLENGE;
+		    verdict = floodguard_challenge (vm, fm, b[0], eth, ip, tcp,
+						    is_syn);
+		    break;
+		  }
 	      }
 	    if (!(v & FLOODGUARD_V_SYN) || !(flags & TCP_FLAG_SYN))
 	      break;

@@ -272,8 +272,11 @@ cnat_config (vlib_main_t * vm, unformat_input_t * input)
   cm->snat_hash_buckets = CNAT_DEFAULT_SNAT_BUCKETS;
   cm->snat_if_map_length = CNAT_DEFAULT_SNAT_IF_MAP_LEN;
   cm->scanner_timeout = CNAT_DEFAULT_SCANNER_TIMEOUT;
+  cm->scanner_burst_pct = CNAT_DEFAULT_SCANNER_BURST_PCT;
   cm->session_max_age = CNAT_DEFAULT_SESSION_MAX_AGE;
   cm->tcp_max_age = CNAT_DEFAULT_TCP_MAX_AGE;
+  cm->tcp_half_open_age = CNAT_DEFAULT_TCP_HALF_OPEN_AGE;
+  cm->udp_unreplied_age = CNAT_DEFAULT_UDP_UNREPLIED_AGE;
   cm->session_max_port_retries = CNAT_DEFAULT_SESSION_MAX_PORT_RETRIES;
   cm->default_scanner_state = CNAT_SCANNER_ON;
   cm->maglev_len = CNAT_DEFAULT_MAGLEV_LEN;
@@ -302,6 +305,8 @@ cnat_config (vlib_main_t * vm, unformat_input_t * input)
       else if (unformat (input, "session-cleanup-timeout %f",
 			 &cm->scanner_timeout))
 	;
+      else if (unformat (input, "session-cleanup-burst-pct %u", &cm->scanner_burst_pct))
+	;
       else if (unformat (input, "scanner off"))
 	cm->default_scanner_state = CNAT_SCANNER_OFF;
       else if (unformat (input, "scanner on"))
@@ -309,6 +314,10 @@ cnat_config (vlib_main_t * vm, unformat_input_t * input)
       else if (unformat (input, "session-max-age %u", &cm->session_max_age))
 	;
       else if (unformat (input, "tcp-max-age %u", &cm->tcp_max_age))
+	;
+      else if (unformat (input, "tcp-half-open-age %u", &cm->tcp_half_open_age))
+	;
+      else if (unformat (input, "udp-unreplied-age %u", &cm->udp_unreplied_age))
 	;
       else if (unformat (input, "session-max-port-retries %u", &cm->session_max_port_retries))
 	;

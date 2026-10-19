@@ -13,8 +13,9 @@ cnat_scanner_process (vlib_main_t * vm,
 {
   uword event_type, *event_data = 0;
   cnat_main_t *cm = &cnat_main;
-  f64 start_time;
+  f64 start_time, budget = CNAT_SCANNER_BUDGET;
   int enabled = 0, i = 0;
+  u32 n_freed;
 
   while (1)
     {
@@ -44,7 +45,14 @@ cnat_scanner_process (vlib_main_t * vm,
 	}
 
       cnat_client_throttle_pool_process ();
-      i = cnat_session_scan (vm, start_time, i);
+      i = cnat_session_scan (vm, start_time, i, budget, &n_freed);
+      /* mighty_lb: a run that freed many expired sessions means a backlog
+       * (e.g. after a flood): work up to scanner_burst_pct percent of the
+       * period more on the next run, until the backlog is gone — the
+       * usual cost stays upstream's 100us per run. */
+      budget = CNAT_SCANNER_BUDGET;
+      if (n_freed >= CNAT_SCANNER_BURST_MIN_FREED)
+	budget += cm->scanner_timeout * cm->scanner_burst_pct / 100;
     }
   return 0;
 }

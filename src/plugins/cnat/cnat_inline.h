@@ -179,6 +179,51 @@ cnat_timestamp_free (u32 index, bool is_v6)
     }
 }
 
+static_always_inline u8
+icmp_type_is_error_message (u8 icmp_type)
+{
+  switch (icmp_type)
+    {
+    case ICMP4_destination_unreachable:
+    case ICMP4_time_exceeded:
+    case ICMP4_parameter_problem:
+    case ICMP4_source_quench:
+    case ICMP4_redirect:
+    case ICMP4_alternate_host_address:
+      return 1;
+    }
+  return 0;
+}
+
+static_always_inline u8
+icmp6_type_is_error_message (u8 icmp_type)
+{
+  switch (icmp_type)
+    {
+    case ICMP6_destination_unreachable:
+    case ICMP6_time_exceeded:
+    case ICMP6_parameter_problem:
+      return 1;
+    }
+  return 0;
+}
+
+/* mighty_lb: an ICMP error is keyed by its inner packet (see
+ * cnat_make_buffer_5tuple), so it only belongs to an existing session */
+static_always_inline int
+cnat_buffer_is_icmp_error (vlib_buffer_t *b, bool is_v6)
+{
+  if (is_v6)
+    {
+      ip6_header_t *ip6 = vlib_buffer_get_current (b);
+      return ip6->protocol == IP_PROTOCOL_ICMP6 &&
+	     icmp6_type_is_error_message (((icmp46_header_t *) (ip6 + 1))->type);
+    }
+  ip4_header_t *ip4 = vlib_buffer_get_current (b);
+  return ip4->protocol == IP_PROTOCOL_ICMP &&
+	 icmp_type_is_error_message (((icmp46_header_t *) (ip4 + 1))->type);
+}
+
 static_always_inline void
 cnat_lookup_create_or_return (vlib_buffer_t *b, int rv, cnat_bihash_kv_t *bkey,
 			      cnat_bihash_kv_t *bvalue, u32 now, u64 hash, bool is_v6,
@@ -199,6 +244,11 @@ cnat_lookup_create_or_return (vlib_buffer_t *b, int rv, cnat_bihash_kv_t *bkey,
   else if (ksession->key.cs_5tuple.iproto != 0)
     {
       if (!alloc_if_not_found)
+	goto err;
+      /* mighty_lb: no session for an ICMP error without one — every forged
+       * error toward a VIP (or a reflected SYN-ACK's TTL expiry) would
+       * otherwise hold a session for session-max-age */
+      if (PREDICT_FALSE (cnat_buffer_is_icmp_error (b, is_v6)))
 	goto err;
       index_t session_index = cnat_timestamp_new (now, ksession->key.fib_index, is_v6);
       ASSERT ((session_index < CNAT_MAX_SESSIONS || INDEX_INVALID == session_index));
