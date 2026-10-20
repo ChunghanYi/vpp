@@ -82,6 +82,10 @@ typedef struct
 
   u8 *role_by_sw_if_index;	 /* eta_role_t */
   u8 *feature_on_by_sw_if_index; /* interface-output feature attached */
+  /* mighty_lb: a routed WAN interface ("wan l3") takes its inbound
+   * ClientHellos with eta-ip4 on ip4-unicast, ahead of the load balancer */
+  u8 *l3_by_sw_if_index;
+  u8 *l3_on_by_sw_if_index; /* ip4-unicast feature attached */
   eta_per_thread_t *per_thread;
 
   vlib_simple_counter_main_t counters[ETA_N_CNT];
@@ -92,5 +96,6 @@ typedef struct
 
 extern eta_main_t eta_main;
 extern vlib_node_registration_t eta_node;
+extern vlib_node_registration_t eta_ip4_node;
 
 #endif /* __included_eta_h__ */

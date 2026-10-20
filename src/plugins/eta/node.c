@@ -9,8 +9,14 @@
  *
  * One node, "eta", on the "interface-output" arc of the bridge interfaces
  * that have a role (wan/lan), attached only while ETA is enabled — disabled,
- * it is on no packet's path at all. Output side on purpose: like the XDP
- * stage (last in its IPv4 block), only packets actually forwarded are
+ * it is on no packet's path at all. mighty_lb, network mode l4: "eta-ip4"
+ * on ip4-unicast of the routed WAN interface instead (role "wan l3"), after
+ * the input ACL / floodguard and before the load balancer, so it sees the
+ * client -> VIP packet before any NAT or tunnel encapsulation (the LAN
+ * output only has the translated or encapsulated copy).
+ *
+ * Output side (or, for eta-ip4, after the input ACL) on purpose: like the
+ * XDP stage (last in its IPv4 block), only packets actually forwarded are
  * looked at, so sources the ACL already blocks don't use up the extraction
  * budget during a flood.
  *
@@ -254,8 +260,27 @@ eta_slow (vlib_main_t *vm, eta_main_t *em, eta_per_thread_t *pt,
   copies[(*n_copies)++] = vlib_get_buffer_index (vm, c);
 }
 
-VLIB_NODE_FN (eta_node)
-(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+/* eta_l2_rewind: how far back the untagged Ethernet header of b starts
+ * (eta-ip4: the buffer starts at the IP header), 0 if it is not there. */
+static_always_inline word
+eta_l2_rewind (vlib_buffer_t *b)
+{
+  if (b->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID)
+    return b->current_data - vnet_buffer (b)->l2_hdr_offset ==
+		 sizeof (ethernet_header_t) ?
+	     sizeof (ethernet_header_t) :
+	     0;
+  return sizeof (ethernet_header_t);
+}
+
+/* eta_inline: the "eta" node (is_l3 = 0, interface-output: the buffer
+ * starts at the Ethernet header) or, mighty_lb, "eta-ip4" (is_l3,
+ * ip4-unicast of a routed WAN interface: the buffer starts at the IP
+ * header and is rewound to the Ethernet header in front of it for the
+ * same checks and copy, so etad gets the same frames either way). */
+static_always_inline uword
+eta_inline (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame,
+	    int is_l3)
 {
   eta_main_t *em = &eta_main;
   u32 *from = vlib_frame_vector_args (frame);
@@ -285,7 +310,7 @@ VLIB_NODE_FN (eta_node)
       goto done;
     }
 
-  while (n_left >= 8)
+  while (!is_l3 && n_left >= 8)
     {
       u32 next0, next1, next2, next3;
       int k0, k1, k2, k3;
@@ -339,10 +364,26 @@ VLIB_NODE_FN (eta_node)
 
       vnet_feature_next (&next0, b[0]);
       next[0] = (u16) next0;
-      k0 = eta_classify (pt, b[0]);
-      if (PREDICT_FALSE (k0))
-	eta_slow (vm, em, pt, b[0], k0, &now, copies, &n_copies,
-		  &n_rate_limited, &n_no_buffer);
+      if (is_l3)
+	{
+	  word l2 = eta_l2_rewind (b[0]);
+	  if (l2)
+	    {
+	      vlib_buffer_advance (b[0], -l2);
+	      k0 = eta_classify (pt, b[0]);
+	      if (PREDICT_FALSE (k0))
+		eta_slow (vm, em, pt, b[0], k0, &now, copies, &n_copies,
+			  &n_rate_limited, &n_no_buffer);
+	      vlib_buffer_advance (b[0], l2);
+	    }
+	}
+      else
+	{
+	  k0 = eta_classify (pt, b[0]);
+	  if (PREDICT_FALSE (k0))
+	    eta_slow (vm, em, pt, b[0], k0, &now, copies, &n_copies,
+		      &n_rate_limited, &n_no_buffer);
+	}
       b++;
       next++;
       n_left--;
@@ -372,8 +413,26 @@ done:
   return frame->n_vectors;
 }
 
+VLIB_NODE_FN (eta_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return eta_inline (vm, node, frame, 0);
+}
+
+VLIB_NODE_FN (eta_ip4_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return eta_inline (vm, node, frame, 1);
+}
+
 VLIB_REGISTER_NODE (eta_node) = {
   .name = "eta",
+  .vector_size = sizeof (u32),
+  .type = VLIB_NODE_TYPE_INTERNAL,
+};
+
+VLIB_REGISTER_NODE (eta_ip4_node) = {
+  .name = "eta-ip4",
   .vector_size = sizeof (u32),
   .type = VLIB_NODE_TYPE_INTERNAL,
 };

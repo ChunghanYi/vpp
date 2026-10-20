@@ -281,12 +281,16 @@ floodguard_wanted_arcs (floodguard_if_t *ifc)
       storm = 1;
   if (ifc->enabled && ifc->l3)
     {
-      /* mighty_lb: a routed interface — storm and victim in one node on
-       * ip4-unicast, ARP on the arp arc (an L3 interface drops non-IP
-       * frames itself, and IPv6 while it has no IPv6 address). */
+      /* mighty_lb: a routed interface — victim on ip4-unicast after the
+       * ACL, storm before it (and on ip4-multicast), ARP on the arp arc
+       * (an L3 interface drops non-IP frames itself, and IPv6 while it has
+       * no IPv6 address). */
       want |= FLOODGUARD_ARC_L3_IP4;
       if (ifc->policer[FLOODGUARD_KIND_ARP - 1] != ~0)
 	want |= FLOODGUARD_ARC_L3_ARP;
+      for (i = FLOODGUARD_KIND_BROADCAST; i <= FLOODGUARD_KIND_MULTICAST; i++)
+	if (ifc->policer[i - 1] != ~0)
+	  want |= FLOODGUARD_ARC_L3_STORM;
     }
   else if (ifc->enabled)
     {
@@ -319,6 +323,8 @@ floodguard_set_arcs (floodguard_if_t *ifc, u32 sw_if_index, u8 want)
     { FLOODGUARD_ARC_WAN_REPLY, "l2-output-ip4", "floodguard-wan-reply" },
     { FLOODGUARD_ARC_L3_IP4, "ip4-unicast", "floodguard-ip4", 1 },
     { FLOODGUARD_ARC_L3_ARP, "arp", "floodguard-arp", 1 },
+    { FLOODGUARD_ARC_L3_STORM, "ip4-unicast", "floodguard-ip4-storm", 1 },
+    { FLOODGUARD_ARC_L3_STORM, "ip4-multicast", "floodguard-ip4-storm", 1 },
   };
   int i;
 

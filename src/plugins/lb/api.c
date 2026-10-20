@@ -68,6 +68,11 @@ vl_api_lb_add_del_vip_t_handler
       mp->protocol = ~0;
     }
 
+  /* mighty_lb: free what earlier deletes left behind (VIPs and ASs past
+   * their grace time) — the CLI does this before every change, the API
+   * did not, so VIPs deleted through it stayed allocated until restart */
+  lb_garbage_collection ();
+
   ip_address_decode (&mp->pfx.address, &(args.prefix));
 
   if (mp->is_del) {
@@ -138,6 +143,9 @@ vl_api_lb_add_del_vip_v2_t_handler (vl_api_lb_add_del_vip_v2_t *mp)
     {
       mp->protocol = ~0;
     }
+
+  /* mighty_lb: see vl_api_lb_add_del_vip_t_handler */
+  lb_garbage_collection ();
 
   ip_address_decode (&mp->pfx.address, &(args.prefix));
 
@@ -222,6 +230,9 @@ vl_api_lb_add_del_as_t_handler
     {
       mp->protocol = ~0;
     }
+  /* mighty_lb: see vl_api_lb_add_del_vip_t_handler */
+  lb_garbage_collection ();
+
   ip_address_decode (&mp->pfx.address, &vip_ip_prefix);
   ip_address_decode (&mp->as_address, &as_address);
 
@@ -432,6 +443,9 @@ vl_api_lb_add_del_as_v2_t_handler (vl_api_lb_add_del_as_v2_t *mp)
 
   if (mp->port == 0)
     mp->protocol = ~0;
+  /* mighty_lb: see vl_api_lb_add_del_vip_t_handler */
+  lb_garbage_collection ();
+
   ip_address_decode (&mp->pfx.address, &vip_ip_prefix);
   ip_address_decode (&mp->as_address, &as_address);
 

@@ -25,6 +25,11 @@
  *   Storm frames are counted and limited whatever the ACL would decide
  *   about them, as in kernel mode.
  *
+ *   mighty_lb, routed interface (network mode l4): floodguard-ip4-storm
+ *   does the same on ip4-unicast BEFORE the input ACL and on ip4-multicast
+ *   (IP multicast never takes ip4-unicast), floodguard-arp on the arp arc,
+ *   and floodguard-ip4 (ip4-unicast, after the ACL) is the victim node.
+ *
  *   floodguard-victim — l2-input-ip4 arc, AFTER the ACL node (attacker
  *   blocklist and WAN Service Port ACL already applied), IPv4 dst = armed
  *   victim:
@@ -608,10 +613,9 @@ floodguard_challenge (vlib_main_t *vm, floodguard_main_t *fm, vlib_buffer_t *b,
 /* floodguard_victim_inline: the victim node on an L2 arc (is_l3 = 0, the
  * buffer starts at the Ethernet header) or, mighty_lb, on ip4-unicast of
  * a routed interface (is_l3, network mode l4: the buffer starts at the IP
- * header, the Ethernet header is still in front of it). The L3 node also
- * polices the frames sent to a group MAC (broadcast/multicast storm — on
- * L2 the storm nodes do it before the ACL; here it is one node after the
- * ACL, whatever the ACL drops never reaches it). */
+ * header, the Ethernet header is still in front of it). On L3 the frames
+ * sent to a group MAC pass untouched: floodguard-ip4-storm, ahead of the
+ * ACL as on L2, has already policed them. */
 static_always_inline uword
 floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			  vlib_frame_t *frame, int is_l3)
@@ -629,7 +633,6 @@ floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   /* mighty_lb: only VIP SYN Guard entries — other packets need no lookup */
   int guard_only = fm->n_victims == fm->n_guard_only;
   u64 now = clib_cpu_time_now ();
-  u64 pnow = now >> POLICER_TICKS_PER_PERIOD_SHIFT;
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -661,24 +664,9 @@ floodguard_victim_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       vnet_feature_next_u16 (next, b[0]);
 
+      /* A group-MAC frame was already policed by floodguard-ip4-storm. */
       if (is_l3 && PREDICT_FALSE (eth[0] & 1))
-	{
-	  u32 sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
-	  u32 pi = ~0;
-	  kind = floodguard_l2_kind (eth);
-	  if (sw_if_index < vec_len (fm->ifs))
-	    pi = fm->ifs[sw_if_index].policer[kind - 1];
-	  if (pi != ~0 && floodguard_police (vm, fm, b[0], pi, pnow))
-	    verdict = FLOODGUARD_VERDICT_DROP;
-	  if (verdict == FLOODGUARD_VERDICT_DROP)
-	    {
-	      next[0] = FLOODGUARD_NEXT_DROP;
-	      b[0]->error = node->errors[FLOODGUARD_ERROR_DROP];
-	      drops[kind]++;
-	      n_dropped++;
-	    }
-	  goto done;
-	}
+	goto done;
 
       if (!check_victims || (u8 *) (ip + 1) > end)
 	goto done;
@@ -853,6 +841,61 @@ VLIB_NODE_FN (floodguard_ip4_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
   return floodguard_victim_inline (vm, node, frame, 1);
+}
+
+/* mighty_lb: floodguard-ip4-storm — a routed interface's broadcast /
+ * L2-control / multicast storm policers, on ip4-unicast before the input
+ * ACL (so a storm the ACL drops anyway is still counted and limited, as on
+ * L2) and on ip4-multicast. The buffer starts at the IP header; a unicast
+ * MAC costs one bit test. */
+VLIB_NODE_FN (floodguard_ip4_storm_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  floodguard_main_t *fm = &floodguard_main;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 n_left = frame->n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
+  u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
+  u32 drops[FLOODGUARD_N_KIND] = { 0 };
+  u32 n_dropped = 0;
+  u64 now = clib_cpu_time_now () >> POLICER_TICKS_PER_PERIOD_SHIFT;
+
+  vlib_get_buffers (vm, from, bufs, n_left);
+  while (n_left > 0)
+    {
+      u8 *ip = vlib_buffer_get_current (b[0]);
+      u8 *eth = (b[0]->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID) ?
+		  b[0]->data + vnet_buffer (b[0])->l2_hdr_offset :
+		  ip - sizeof (ethernet_header_t);
+      u32 sw_if_index = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+      floodguard_kind_t kind = floodguard_l2_kind (eth);
+      u32 pi = ~0;
+      int drop = 0;
+
+      if (n_left > 2)
+	vlib_prefetch_buffer_header (b[2], LOAD);
+
+      vnet_feature_next_u16 (next, b[0]);
+      if (kind != FLOODGUARD_KIND_NONE && sw_if_index < vec_len (fm->ifs))
+	pi = fm->ifs[sw_if_index].policer[kind - 1];
+      if (pi != ~0 && floodguard_police (vm, fm, b[0], pi, now))
+	{
+	  drop = 1;
+	  next[0] = FLOODGUARD_NEXT_DROP;
+	  b[0]->error = node->errors[FLOODGUARD_ERROR_DROP];
+	  drops[kind]++;
+	  n_dropped++;
+	}
+      floodguard_trace (vm, node, b[0], sw_if_index, pi, kind,
+			drop ? FLOODGUARD_VERDICT_DROP : FLOODGUARD_VERDICT_PASS);
+      b++;
+      next++;
+      n_left--;
+    }
+  if (n_dropped)
+    floodguard_count_drops (vm, fm, drops);
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+  return frame->n_vectors;
 }
 
 /* mighty_lb: floodguard-arp — a routed interface's ARP storm policer, on
@@ -1067,6 +1110,7 @@ FLOODGUARD_NODE (floodguard_l2_ip6_node, "floodguard-l2-ip6");
 FLOODGUARD_NODE (floodguard_l2_nonip_node, "floodguard-l2-nonip");
 FLOODGUARD_NODE (floodguard_victim_node, "floodguard-victim");
 FLOODGUARD_NODE (floodguard_ip4_node, "floodguard-ip4");  /* mighty_lb */
+FLOODGUARD_NODE (floodguard_ip4_storm_node, "floodguard-ip4-storm"); /* mighty_lb */
 FLOODGUARD_NODE (floodguard_arp_node, "floodguard-arp");  /* mighty_lb */
 
 VNET_FEATURE_INIT (floodguard_l2_ip4_feature, static) = {
@@ -1109,6 +1153,20 @@ VNET_FEATURE_INIT (floodguard_ip4_feature, static) = {
   .node_name = "floodguard-ip4",
   .runs_after = VNET_FEATURES ("acl-plugin-in-ip4-fa", "ip4-inacl"),
   .runs_before = VNET_FEATURES ("lb4-vip-echo", "ip4-lookup"),
+};
+
+/* mighty_lb: floodguard-ip4-storm ahead of the input ACL, as the L2 storm
+ * nodes are; IP multicast takes ip4-multicast (no input ACL there). */
+VNET_FEATURE_INIT (floodguard_ip4_storm_feature, static) = {
+  .arc_name = "ip4-unicast",
+  .node_name = "floodguard-ip4-storm",
+  .runs_before = VNET_FEATURES ("acl-plugin-in-ip4-fa", "ip4-inacl"),
+};
+
+VNET_FEATURE_INIT (floodguard_ip4_mcast_storm_feature, static) = {
+  .arc_name = "ip4-multicast",
+  .node_name = "floodguard-ip4-storm",
+  .runs_before = VNET_FEATURES ("ip4-mfib-forward-lookup"),
 };
 
 VNET_FEATURE_INIT (floodguard_arp_feature, static) = {

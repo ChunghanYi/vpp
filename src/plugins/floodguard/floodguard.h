@@ -96,9 +96,11 @@ typedef enum
 #define FLOODGUARD_ARC_VICTIM	   (1 << 3)
 #define FLOODGUARD_ARC_WAN_REPLY   (1 << 4)
 /* mighty_lb: a routed interface (network mode l4) — floodguard-ip4 on
- * ip4-unicast and floodguard-arp on the arp arc instead of the L2 arcs */
+ * ip4-unicast, floodguard-arp on the arp arc and floodguard-ip4-storm on
+ * ip4-unicast + ip4-multicast instead of the L2 arcs */
 #define FLOODGUARD_ARC_L3_IP4	   (1 << 5)
 #define FLOODGUARD_ARC_L3_ARP	   (1 << 6)
+#define FLOODGUARD_ARC_L3_STORM	   (1 << 7)
 
 /* Per-interface state. policer: Broadcast Filter policers, indexed by
  * kind - 1 (~0 = none). enabled: storm/victim policing ("interface ...

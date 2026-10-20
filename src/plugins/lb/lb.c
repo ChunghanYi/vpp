@@ -405,6 +405,8 @@ void lb_garbage_collection()
   vec_foreach(i, to_be_removed_vips) {
       vip = &lbm->vips[*i];
       pool_free (vip->as_indexes);
+      /* mighty_lb: lb_vip_add starts a reused slot with a new table */
+      vec_free (vip->new_flow_table);
       pool_put (lbm->vips, vip);
   }
 
@@ -1316,8 +1318,11 @@ int lb_vip_del(u32 vip_index)
         as = &lbm->ass[*as_index];
         vec_add1(ass, as->address);
     }
+    /* mighty_lb: flushed — a deleted VIP's flows have nowhere to go, and
+     * their sticky entries would hold the ASs' refcounts, so the garbage
+     * collection could never free the ASs (nor, with them, the VIP) */
     if (vec_len(ass))
-      lb_vip_del_ass_withlock(vip_index, ass, vec_len(ass), 0);
+      lb_vip_del_ass_withlock(vip_index, ass, vec_len(ass), 1);
     vec_free(ass);
   }
 
