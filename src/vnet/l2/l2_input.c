@@ -316,14 +316,26 @@ set_int_l2_mode (vlib_main_t * vm, vnet_main_t * vnet_main,	/*           */
     {
       /* Set L2 config to BD index 0 so that if any packet accidentally
        * came in on L2 path, it will be dropped in BD 0 */
+      /* mighty_lb: keep the L2 feature-arc bits. They are set only when an
+       * arc's feature count on the interface goes 0 -> 1
+       * (vnet_l2_feature_enable_disable), and the arc's features outlive
+       * the mode change — without this, an interface put back into a
+       * bridge domain or cross-connect (a bridge edit tears its members
+       * down to L3 and adds them again) keeps its l2-input-ip4 /
+       * l2-output-ip4 features enabled but never runs them. */
+      u32 in_arc = config->feature_bitmap & L2INPUT_FEAT_INPUT_FEAT_ARC;
+      u32 out_arc;
+
       config->flags = L2_INPUT_FLAG_NONE;
       config->shg = 0;
       config->bd_index = 0;
-      config->feature_bitmap = L2INPUT_FEAT_DROP;
+      config->feature_bitmap = L2INPUT_FEAT_DROP | in_arc;
 
       /* Clear L2 output config */
       out_config = l2output_intf_config (sw_if_index);
+      out_arc = out_config->feature_bitmap & L2OUTPUT_FEAT_OUTPUT_FEAT_ARC;
       clib_memset (out_config, 0, sizeof (l2_output_config_t));
+      out_config->feature_bitmap = out_arc;
 
       /* Make sure any L2-output packet to this interface now in L3 mode is
        * dropped. This may happen if L2 FIB MAC entry is stale */
