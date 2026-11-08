@@ -20,14 +20,16 @@
 #include <vppinfra/bihash_8_8.h>
 #include <vppinfra/bihash_8_16.h>
 
-/* Return table: one entry per intercepted client socket (ip, port, proto),
- * refreshed by every query packet, swept after DNSFILTER_RET_TTL_SEC
- * without one. At DNSFILTER_RET_MAX entries new clients bypass (forwarded
- * unfiltered) instead of evicting — same size as xdp_bridge's LRU map. */
-#define DNSFILTER_RET_MAX	  65536
+/* Return table: one entry per outstanding query (client ip, port, proto).
+ * A UDP entry is removed when its answer goes back; what is left (TCP,
+ * unanswered queries) is swept after DNSFILTER_RET_TTL_SEC without a query
+ * packet. At DNSFILTER_RET_MAX entries new queries bypass (forwarded
+ * unfiltered) instead of evicting. 262,144 covers ~25,000 qps with answers
+ * taking up to 10 s — same size as xdp_bridge's dnsf_ret_map. */
+#define DNSFILTER_RET_MAX	  262144
 #define DNSFILTER_RET_BUCKETS	  (DNSFILTER_RET_MAX / 4)
-#define DNSFILTER_RET_MEMORY	  (32 << 20)
-#define DNSFILTER_RET_TTL_SEC	  30
+#define DNSFILTER_RET_MEMORY	  (128 << 20)
+#define DNSFILTER_RET_TTL_SEC	  10
 /* Per-client rate windows (1 second), swept like the return table. */
 #define DNSFILTER_CLIENT_MAX	  65536
 #define DNSFILTER_CLIENT_BUCKETS  (DNSFILTER_CLIENT_MAX / 4)
@@ -37,6 +39,11 @@
 #define DNSFILTER_DOH_MAX	  16384
 #define DNSFILTER_DOH_BUCKETS	  4096
 #define DNSFILTER_DOH_MEMORY	  (4 << 20)
+/* Clients without the per-client limit ("dnsfilter exempt set"): in-house
+ * resolvers and NAT devices that speak for many hosts. */
+#define DNSFILTER_EXEMPT_MAX	  64
+#define DNSFILTER_EXEMPT_BUCKETS  64
+#define DNSFILTER_EXEMPT_MEMORY	  (1 << 20)
 
 #define DNSFILTER_SWEEP_INTERVAL 2.0 /* seconds */
 
@@ -112,6 +119,8 @@ typedef struct
   volatile u32 n_clients;
   clib_bihash_8_8_t doh_ips; /* IPv4 (network order) -> 1 */
   u32 n_doh_ips;
+  clib_bihash_8_8_t exempt; /* client IPv4 (network order) -> 1 */
+  u32 n_exempt;
 
   /* Global rate window (all workers). */
   volatile u32 global_sec;

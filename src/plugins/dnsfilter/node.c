@@ -22,6 +22,7 @@
  *   traffic is the protocol/port test.
  *
  *   dnsfilter-return — device-input arc of the tap: the engine's answers
+ *   (a UDP answer also frees its return entry)
  *   (Linux routes them out of the tap toward a fixed neighbour, see
  *   virtserver/dnsf/linux.go). Source port 53 and a return entry for
  *   (destination ip, port, proto): MACs restored (source = the client's
@@ -156,6 +157,18 @@ dnsfilter_client_over (dnsfilter_main_t *dm, u32 client_ip, u32 now)
   return count > dm->client_qps;
 }
 
+/* dnsfilter_exempt: 1 = the client is not under the per-client limit. */
+static_always_inline int
+dnsfilter_exempt (dnsfilter_main_t *dm, u32 client_ip)
+{
+  clib_bihash_kv_8_8_t kv, val;
+
+  if (!dm->n_exempt)
+    return 0;
+  kv.key = client_ip;
+  return clib_bihash_search_8_8 (&dm->exempt, &kv, &val) == 0;
+}
+
 /* dnsfilter_global_over: all workers' 1-second window; 1 = over. */
 static_always_inline int
 dnsfilter_global_over (dnsfilter_main_t *dm, u32 now)
@@ -240,12 +253,13 @@ VLIB_NODE_FN (dnsfilter_lan_node)
       if (dport != DNSFILTER_PORT_DNS && dport != DNSFILTER_PORT_DOT &&
 	  dport != DNSFILTER_PORT_DOH)
 	goto done;
-      if (!dnsfilter_toward_wan (dm, b[0], eth))
-	goto done;
 
+      /* Each branch settles its own cheap conditions before the l2fib
+       * lookup (dnsfilter_toward_wan): most LAN -> WAN traffic is HTTPS,
+       * and only a new connection to a DoH address may pay for it. */
       if (dport == DNSFILTER_PORT_DOT)
 	{
-	  if (dm->block_dot)
+	  if (dm->block_dot && dnsfilter_toward_wan (dm, b[0], eth))
 	    {
 	      verdict = DNSFILTER_VERDICT_DROP;
 	      dnsfilter_count (vm, dm, DNSFILTER_CNT_DOT_DROPPED);
@@ -272,7 +286,8 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	  if (!first)
 	    goto done;
 	  kv.key = ip->dst_address.as_u32;
-	  if (clib_bihash_search_8_8 (&dm->doh_ips, &kv, &val) == 0)
+	  if (clib_bihash_search_8_8 (&dm->doh_ips, &kv, &val) == 0 &&
+	      dnsfilter_toward_wan (dm, b[0], eth))
 	    {
 	      verdict = DNSFILTER_VERDICT_DROP;
 	      dnsfilter_count (vm, dm, DNSFILTER_CNT_DOH_DROPPED);
@@ -281,7 +296,8 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	}
 
       /* dport 53 */
-      if (!dm->intercept || dm->tap_sw_if_index == ~0)
+      if (!dm->intercept || dm->tap_sw_if_index == ~0 ||
+	  !dnsfilter_toward_wan (dm, b[0], eth))
 	goto done;
       if (!dm->daemon_ok)
 	{
@@ -289,7 +305,7 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	  dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_DAEMON_DOWN);
 	  goto done;
 	}
-      if (dm->client_qps &&
+      if (dm->client_qps && !dnsfilter_exempt (dm, ip->src_address.as_u32) &&
 	  dnsfilter_client_over (dm, ip->src_address.as_u32, now))
 	{
 	  verdict = DNSFILTER_VERDICT_DROP;
@@ -370,6 +386,11 @@ VLIB_NODE_FN (dnsfilter_return_node)
       clib_memcpy_fast (e->dst_address, r.client_mac, 6);
       clib_memcpy_fast (e->src_address, r.gw_mac, 6);
       vnet_buffer (b[0])->sw_if_index[VLIB_TX] = r.sw_if_index;
+      /* A UDP query has exactly one answer: free its entry now (a TCP
+       * connection keeps it for the next query, the sweep ends it). */
+      if (ip->protocol == IP_PROTOCOL_UDP &&
+	  clib_bihash_add_del_8_16 (&dm->ret, &kv, 0 /* del */) == 0)
+	clib_atomic_fetch_sub (&dm->n_ret, 1);
       next[0] = DNSFILTER_NEXT_OUTPUT;
       dnsfilter_count (vm, dm, DNSFILTER_CNT_RETURNED);
       dnsfilter_trace (vm, node, b[0], DNSFILTER_PORT_DNS,

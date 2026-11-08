@@ -11,6 +11,7 @@
  *                    [client-qps <n>] [global-qps <n>]
  *   dnsfilter health up|down
  *   dnsfilter doh-ip load <file> | dnsfilter doh-ip clear
+ *   dnsfilter exempt set [<ip> ...]   (replaces the set; none = empty)
  *   dnsfilter reset
  *   show dnsfilter
  */
@@ -56,7 +57,9 @@ dnsfilter_tables_init (dnsfilter_main_t *dm)
 			DNSFILTER_CLIENT_BUCKETS, DNSFILTER_CLIENT_MEMORY);
   clib_bihash_init_8_8 (&dm->doh_ips, "dnsfilter doh ips",
 			DNSFILTER_DOH_BUCKETS, DNSFILTER_DOH_MEMORY);
-  dm->n_ret = dm->n_clients = dm->n_doh_ips = 0;
+  clib_bihash_init_8_8 (&dm->exempt, "dnsfilter exempt",
+			DNSFILTER_EXEMPT_BUCKETS, DNSFILTER_EXEMPT_MEMORY);
+  dm->n_ret = dm->n_clients = dm->n_doh_ips = dm->n_exempt = 0;
 }
 
 /* Called with the workers stopped (CLI barrier). */
@@ -66,6 +69,7 @@ dnsfilter_tables_reset (dnsfilter_main_t *dm)
   clib_bihash_free_8_16 (&dm->ret);
   clib_bihash_free_8_8 (&dm->clients);
   clib_bihash_free_8_8 (&dm->doh_ips);
+  clib_bihash_free_8_8 (&dm->exempt);
   dnsfilter_tables_init (dm);
 }
 
@@ -376,6 +380,48 @@ dnsfilter_doh_command_fn (vlib_main_t *vm, unformat_input_t *input,
   return 0;
 }
 
+/* dnsfilter exempt set [<ip> ...]: replaces the exempt client set (CLI
+ * barrier: the workers are stopped while the table is rebuilt). */
+static clib_error_t *
+dnsfilter_exempt_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			     vlib_cli_command_t *cmd)
+{
+  dnsfilter_main_t *dm = &dnsfilter_main;
+  ip4_address_t a, *ips = 0, *ip;
+  clib_error_t *e = 0;
+
+  if (!unformat (input, "set"))
+    return clib_error_return (0, "specify set [<ip> ...]");
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (!unformat (input, "%U", unformat_ip4_address, &a))
+	{
+	  e = clib_error_return (0, "bad address '%U'", format_unformat_error,
+				 input);
+	  goto done;
+	}
+      vec_add1 (ips, a);
+    }
+  if (vec_len (ips) > DNSFILTER_EXEMPT_MAX)
+    {
+      e = clib_error_return (0, "at most %u addresses", DNSFILTER_EXEMPT_MAX);
+      goto done;
+    }
+  clib_bihash_free_8_8 (&dm->exempt);
+  clib_bihash_init_8_8 (&dm->exempt, "dnsfilter exempt",
+			DNSFILTER_EXEMPT_BUCKETS, DNSFILTER_EXEMPT_MEMORY);
+  dm->n_exempt = 0;
+  vec_foreach (ip, ips)
+    {
+      clib_bihash_kv_8_8_t kv = { .key = ip->as_u32, .value = 1 };
+      if (clib_bihash_add_del_8_8 (&dm->exempt, &kv, 1) == 0)
+	dm->n_exempt++;
+    }
+done:
+  vec_free (ips);
+  return e;
+}
+
 /* dnsfilter reset: everything off and empty (DNS Sinkhole taken down). */
 static clib_error_t *
 dnsfilter_reset_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -426,6 +472,7 @@ show_dnsfilter_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vlib_cli_output (vm, "pending_queries: %u", dm->n_ret);
   vlib_cli_output (vm, "tracked_clients: %u", dm->n_clients);
   vlib_cli_output (vm, "doh_addresses: %u", dm->n_doh_ips);
+  vlib_cli_output (vm, "exempt_clients: %u", dm->n_exempt);
   return 0;
 }
 
@@ -461,6 +508,12 @@ VLIB_CLI_COMMAND (dnsfilter_doh_command, static) = {
   .path = "dnsfilter doh-ip",
   .short_help = "dnsfilter doh-ip load <file> | dnsfilter doh-ip clear",
   .function = dnsfilter_doh_command_fn,
+};
+
+VLIB_CLI_COMMAND (dnsfilter_exempt_command, static) = {
+  .path = "dnsfilter exempt",
+  .short_help = "dnsfilter exempt set [<ip> ...]",
+  .function = dnsfilter_exempt_command_fn,
 };
 
 VLIB_CLI_COMMAND (dnsfilter_reset_command, static) = {
