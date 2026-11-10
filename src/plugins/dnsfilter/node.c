@@ -11,13 +11,19 @@
  *     dport 853, block_dot             -> drop (dot_dropped)
  *     dport 443, block_doh_ip, TCP SYN
  *       or QUIC long header, DoH IP    -> drop (doh_dropped)
- *     dport 53, intercept:
- *       engine not answering           -> bridged (bypass_daemon_down)
+ *     dport 53 (intercept or fastpath):
+ *       UDP query counted per client (Busiest / Active Clients)
  *       over the client's qps          -> drop (client_limit_dropped)
+ *       fastpath, UDP: the block table (dnsfilter_judge) — blocked ->
+ *         answered in place, out of the port it came in on (fp_blocked),
+ *         reported to etad ("DNF1" frame on the events interface)
+ *       no intercept (Fast mode)       -> bridged (fp_passed)
+ *       engine not answering           -> bridged (bypass_daemon_down)
  *       over the global qps / table full -> bridged (bypass_global_limit)
  *       else                           -> return entry stored, destination
  *                                         MAC = the tap's Linux end, sent
  *                                         to the tap (redirected)
+ *     (without fastpath the engine's health is checked first, as before)
  *   Everything else continues on the arc untouched: the cost for non-DNS
  *   traffic is the protocol/port test.
  *
@@ -45,6 +51,7 @@
 #include <vnet/tcp/tcp_packet.h>
 #include <vnet/udp/udp_packet.h>
 #include <vnet/l2/l2_fib.h>
+#include <vppinfra/time.h>
 #include <dnsfilter/dnsfilter.h>
 
 #define DNSFILTER_PORT_DNS 53
@@ -65,6 +72,7 @@ typedef enum
   DNSFILTER_VERDICT_BYPASS,
   DNSFILTER_VERDICT_DROP,
   DNSFILTER_VERDICT_RETURN,
+  DNSFILTER_VERDICT_BLOCK,
 } dnsfilter_verdict_t;
 
 typedef struct
@@ -79,8 +87,8 @@ static char *dnsfilter_error_strings[] = { "dropped by the DNS Sinkhole" };
 static u8 *
 format_dnsfilter_trace (u8 *s, va_list *args)
 {
-  static const char *const names[] = { "pass", "redirect", "bypass", "drop",
-				       "return" };
+  static const char *const names[] = { "pass",	 "redirect", "bypass",
+				       "drop",	 "return",   "block" };
   CLIB_UNUSED (vlib_main_t * vm) = va_arg (*args, vlib_main_t *);
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   dnsfilter_trace_t *t = va_arg (*args, dnsfilter_trace_t *);
@@ -207,6 +215,269 @@ dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth,
   return 1;
 }
 
+/* ─── Fast path ─────────────────────────────────────────────────────── */
+
+/* The query being judged: name[] is the wire name with every length byte
+ * replaced by '.', lowercased ("\3www\7example\3com" -> ".www.example.com"),
+ * name_len without the root 0. */
+typedef struct
+{
+  u8 name[DNSFILTER_QNAME_MAX + 1];
+  u32 name_len;
+  u16 qtype;
+  u16 qclass;
+  u8 has_opt;
+  u32 cats; /* the blocking bits */
+} dnsfilter_query_t;
+
+#define DNSFILTER_DNS_OFF                                                     \
+  (sizeof (ethernet_header_t) + sizeof (ip4_header_t) + sizeof (udp_header_t))
+
+/* dnsfilter_parse: 1 for a query the fast path judges — an option-less
+ * IPv4 header, a standard query (QR 0, OPCODE 0) with exactly one
+ * question whose name has no compression pointer, no '.' inside a label
+ * and its end within DNSFILTER_QNAME_MAX (xdp_bridge's dnsf_parse). */
+static_always_inline int
+dnsfilter_parse (ip4_header_t *ip, u8 *end, dnsfilter_query_t *q)
+{
+  u8 *dns = (u8 *) ip + sizeof (ip4_header_t) + sizeof (udp_header_t);
+  u8 *p;
+  u32 i, next = 0;
+
+  if (ip->ip_version_and_header_length != 0x45 || dns + 12 > end)
+    return 0;
+  if ((dns[2] & 0xf8) || dns[4] || dns[5] != 1)
+    return 0;
+  q->has_opt = dns[10] | dns[11];
+  p = dns + 12;
+  for (i = 0; i <= DNSFILTER_QNAME_MAX; i++)
+    {
+      u8 c;
+      if (p + i >= end)
+	return 0;
+      c = p[i];
+      if (i == next)
+	{
+	  if (c == 0)
+	    {
+	      if (i == 0 || p + i + 5 > end)
+		return 0; /* the root, or no type/class */
+	      q->name_len = i;
+	      q->qtype = ((u16) p[i + 1] << 8) | p[i + 2];
+	      q->qclass = ((u16) p[i + 3] << 8) | p[i + 4];
+	      return 1;
+	    }
+	  if (c & 0xc0)
+	    return 0; /* compression pointer / extended label */
+	  next = i + c + 1;
+	  c = '.';
+	}
+      else if (c >= 'A' && c <= 'Z')
+	c |= 0x20;
+      else if (c == '.')
+	return 0;
+      q->name[i] = c;
+    }
+  return 0;
+}
+
+/* dnsfilter_judge: the blocking bits of q (0 = allowed). Hashed from the
+ * last byte to the first (virtserver/dnsf/hashlist.go): the running value
+ * at each '.' is the hash of the suffix right of it, looked up — at most
+ * DNSFILTER_LOOKUPS_MAX, rightmost first; exact-name bits count only for
+ * the whole name; any Allow bit allows. */
+static_always_inline u32
+dnsfilter_judge (dnsfilter_main_t *dm, clib_bihash_8_8_t *t,
+		 dnsfilter_query_t *q)
+{
+  u64 h = DNSFILTER_FNV_OFFSET;
+  u32 acc = 0, lookups = 0;
+  int i;
+
+  for (i = (int) q->name_len - 1; i >= 0; i--)
+    {
+      u8 c = q->name[i];
+      if (c == '.')
+	{
+	  clib_bihash_kv_8_8_t kv = { .key = h };
+	  if (clib_bihash_search_8_8 (t, &kv, &kv) == 0)
+	    acc |= i == 0 ? (u32) kv.value :
+			    ((u32) kv.value & ~(0xffU << DNSFILTER_EXACT_SHIFT));
+	  if (i == 0 || ++lookups >= DNSFILTER_LOOKUPS_MAX)
+	    break;
+	}
+      h ^= c;
+      h *= DNSFILTER_FNV_PRIME;
+    }
+  if (acc & DNSFILTER_CAT_ALLOW)
+    return 0;
+  return (acc | (acc >> DNSFILTER_EXACT_SHIFT)) & dm->cat_mask &
+	 DNSFILTER_CAT_BITS;
+}
+
+/* dnsfilter_reply: turns the blocked query in b into its answer, in place
+ * (xdp_bridge's dnsf_block_reply): same question; A -> 0.0.0.0, AAAA ->
+ * ::, other types (or a class other than IN) -> NODATA, TTL block_ttl; a
+ * NXDOMAIN-bit name -> NXDOMAIN; everything after the question goes, a
+ * query with an additional record (EDNS) gets a minimal OPT back. No room
+ * in the buffer for the record: NXDOMAIN (fp_nxdomain). Returns 0 when no
+ * answer could be built. The caller sends it back out of the RX port. */
+static_always_inline int
+dnsfilter_reply (vlib_main_t *vm, dnsfilter_main_t *dm, vlib_buffer_t *b,
+		 dnsfilter_query_t *q)
+{
+  u8 *eth = vlib_buffer_get_current (b);
+  ip4_header_t *ip = (ip4_header_t *) (eth + sizeof (ethernet_header_t));
+  udp_header_t *udp = (udp_header_t *) (ip + 1);
+  u8 *dns = eth + DNSFILTER_DNS_OFF, *p, mac[6];
+  u32 ans = 0, opt = q->has_opt ? 11 : 0, qend, total, room, ttl;
+  u8 rcode = 0;
+  u32 a;
+  u16 port;
+
+  if (q->cats & DNSFILTER_CAT_NXDOMAIN)
+    rcode = 3;
+  else if (q->qclass == 1 && q->qtype == 1)
+    ans = 16;
+  else if (q->qclass == 1 && q->qtype == 28)
+    ans = 28;
+  qend = DNSFILTER_DNS_OFF + 12 + q->name_len + 1 + 4;
+  total = qend + ans + opt;
+  room = vlib_buffer_get_default_data_size (vm) - b->current_data;
+  if (total > room)
+    {
+      if (!ans || qend + opt > room)
+	return 0;
+      ans = 0;
+      rcode = 3;
+      total = qend + opt;
+      vlib_increment_simple_counter (&dm->counters[DNSFILTER_CNT_FP_NXDOMAIN],
+				     vm->thread_index, 0, 1);
+    }
+
+  clib_memcpy_fast (mac, eth + 6, 6);
+  clib_memcpy_fast (eth + 6, eth, 6);
+  clib_memcpy_fast (eth, mac, 6);
+
+  a = ip->src_address.as_u32;
+  ip->src_address.as_u32 = ip->dst_address.as_u32;
+  ip->dst_address.as_u32 = a;
+  ip->length = clib_host_to_net_u16 (total - sizeof (ethernet_header_t));
+  ip->ttl = 64;
+  ip->flags_and_fragment_offset = 0;
+  ip->checksum = ip4_header_checksum (ip);
+
+  port = udp->src_port;
+  udp->src_port = udp->dst_port;
+  udp->dst_port = port;
+  udp->length = clib_host_to_net_u16 (total - sizeof (ethernet_header_t) -
+				      sizeof (ip4_header_t));
+  udp->checksum = 0;
+
+  dns[2] = 0x80 | (dns[2] & 0x01); /* QR, RD as asked */
+  dns[3] = 0x80 | rcode;	   /* RA */
+  dns[6] = 0;
+  dns[7] = ans ? 1 : 0; /* ANCOUNT */
+  dns[8] = dns[9] = 0;	/* NSCOUNT */
+  dns[10] = 0;
+  dns[11] = opt ? 1 : 0; /* ARCOUNT */
+
+  p = eth + qend;
+  ttl = dm->block_ttl;
+  if (ans)
+    {
+      p[0] = 0xc0;
+      p[1] = 0x0c; /* the question's name */
+      p[2] = 0;
+      p[3] = (u8) q->qtype;
+      p[4] = 0;
+      p[5] = 1; /* IN */
+      p[6] = ttl >> 24;
+      p[7] = ttl >> 16;
+      p[8] = ttl >> 8;
+      p[9] = ttl;
+      p[10] = 0;
+      p[11] = ans - 12;
+      clib_memset (p + 12, 0, ans - 12);
+      p += ans;
+    }
+  if (opt)
+    {
+      p[0] = 0;
+      p[1] = 0;
+      p[2] = 41; /* OPT */
+      p[3] = DNSFILTER_EDNS_UDP >> 8;
+      p[4] = DNSFILTER_EDNS_UDP & 0xff;
+      clib_memset (p + 5, 0, 6); /* ext. RCODE, version, flags, rdlength */
+    }
+  b->current_length = total;
+  return 1;
+}
+
+/* dnsfilter_event: one "DNF1" frame for a blocked query, collected in
+ * evs for the events interface (within DNSFILTER_EVENTS_PER_SEC per
+ * worker and second). Returns 0 when it is not logged. */
+static_always_inline int
+dnsfilter_event (vlib_main_t *vm, dnsfilter_main_t *dm,
+		 dnsfilter_per_thread_t *pt, dnsfilter_query_t *q, u32 rx,
+		 u32 client_ip, u32 now, u32 *evs, u32 *n_evs)
+{
+  vlib_buffer_t *e;
+  dnsfilter_frame_hdr_t *h;
+  dnsfilter_event_t *ev;
+  u32 bi;
+
+  if (dm->events_sw_if_index == ~0 || *n_evs >= VLIB_FRAME_SIZE)
+    return 0;
+  if (pt->event_sec != now)
+    {
+      pt->event_sec = now;
+      pt->event_count = 0;
+    }
+  if (++pt->event_count > DNSFILTER_EVENTS_PER_SEC)
+    return 0;
+  if (vlib_buffer_alloc (vm, &bi, 1) != 1)
+    return 0;
+  e = vlib_get_buffer (vm, bi);
+  h = vlib_buffer_get_current (e);
+  h->magic = DNSFILTER_FRAME_MAGIC;
+  h->sw_if_index = rx;
+  h->flags = h->reserved = 0;
+  ev = (dnsfilter_event_t *) (h + 1);
+  ev->ts_ns = unix_time_now_nsec ();
+  ev->client_ip = client_ip;
+  ev->cats = q->cats;
+  ev->qtype = q->qtype;
+  ev->name_len = clib_min (q->name_len, DNSFILTER_EVENT_NAME_MAX);
+  clib_memcpy_fast (ev->name, q->name, ev->name_len);
+  e->current_length = sizeof (*h) + sizeof (*ev);
+  vnet_buffer (e)->sw_if_index[VLIB_RX] = rx;
+  vnet_buffer (e)->sw_if_index[VLIB_TX] = dm->events_sw_if_index;
+  evs[(*n_evs)++] = bi;
+  return 1;
+}
+
+/* dnsfilter_client_count: one UDP query of client_ip in this worker's
+ * table (Busiest / Active Clients). A full table stops counting new
+ * clients. */
+static_always_inline void
+dnsfilter_client_count (dnsfilter_per_thread_t *pt, u32 client_ip, u32 now)
+{
+  clib_bihash_kv_8_16_t kv = { .key = client_ip }, val;
+
+  if (clib_bihash_search_8_16 (&pt->stats, &kv, &val) == 0)
+    kv.value[0] = val.value[0] + 1;
+  else if (pt->n_stats >= DNSFILTER_CLIENT_MAX)
+    return;
+  else
+    {
+      kv.value[0] = 1;
+      clib_atomic_fetch_add (&pt->n_stats, 1);
+    }
+  kv.value[1] = now;
+  clib_bihash_add_del_8_16 (&pt->stats, &kv, 1 /* add/replace */);
+}
+
 VLIB_NODE_FN (dnsfilter_lan_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
@@ -216,6 +487,14 @@ VLIB_NODE_FN (dnsfilter_lan_node)
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   u16 nexts[VLIB_FRAME_SIZE], *next = nexts;
   u32 now = dnsfilter_now_sec (vm);
+  /* the fast path: this worker's state, the table of this frame, unix
+   * seconds (shared by every worker: client stats, events) */
+  dnsfilter_per_thread_t *pt = vec_elt_at_index (dm->per_thread,
+						  vm->thread_index);
+  clib_bihash_8_8_t *tbl = dm->block;
+  u32 unix_now = 0;
+  u32 evs[VLIB_FRAME_SIZE], n_evs = 0, n_lost = 0;
+  dnsfilter_query_t q;
 
   vlib_get_buffers (vm, from, bufs, n_left);
 
@@ -296,22 +575,76 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	}
 
       /* dport 53 */
-      if (!dm->intercept || dm->tap_sw_if_index == ~0 ||
-	  !dnsfilter_toward_wan (dm, b[0], eth))
-	goto done;
-      if (!dm->daemon_ok)
-	{
-	  verdict = DNSFILTER_VERDICT_BYPASS;
-	  dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_DAEMON_DOWN);
+      {
+	int inspect = dm->intercept && dm->tap_sw_if_index != ~0;
+	if ((!inspect && !dm->fastpath) ||
+	    !dnsfilter_toward_wan (dm, b[0], eth))
 	  goto done;
-	}
-      if (dm->client_qps && !dnsfilter_exempt (dm, ip->src_address.as_u32) &&
-	  dnsfilter_client_over (dm, ip->src_address.as_u32, now))
-	{
-	  verdict = DNSFILTER_VERDICT_DROP;
-	  dnsfilter_count (vm, dm, DNSFILTER_CNT_CLIENT_LIMIT_DROPPED);
-	  goto done;
-	}
+	if (inspect && !dm->fastpath && !dm->daemon_ok)
+	  {
+	    /* no fast path: the engine down = no filtering */
+	    verdict = DNSFILTER_VERDICT_BYPASS;
+	    dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_DAEMON_DOWN);
+	    goto done;
+	  }
+	if (proto == IP_PROTOCOL_UDP)
+	  {
+	    if (!unix_now)
+	      unix_now = (u32) unix_time_now ();
+	    dnsfilter_client_count (pt, ip->src_address.as_u32, unix_now);
+	  }
+	if (dm->client_qps &&
+	    !dnsfilter_exempt (dm, ip->src_address.as_u32) &&
+	    dnsfilter_client_over (dm, ip->src_address.as_u32, now))
+	  {
+	    verdict = DNSFILTER_VERDICT_DROP;
+	    dnsfilter_count (vm, dm, DNSFILTER_CNT_CLIENT_LIMIT_DROPPED);
+	    goto done;
+	  }
+	if (dm->fastpath && tbl && proto == IP_PROTOCOL_UDP)
+	  {
+	    if (b[0]->flags & VLIB_BUFFER_NEXT_PRESENT ||
+		!dnsfilter_parse (ip, end, &q))
+	      dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_SKIPPED);
+	    else
+	      {
+		dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_JUDGED);
+		q.cats = dnsfilter_judge (dm, tbl, &q);
+		if (q.cats)
+		  {
+		    u32 rx = vnet_buffer (b[0])->sw_if_index[VLIB_RX];
+		    u32 client = ip->src_address.as_u32;
+		    if (!unix_now)
+		      unix_now = (u32) unix_time_now ();
+		    if (!dnsfilter_event (vm, dm, pt, &q, rx, client, unix_now,
+					  evs, &n_evs))
+		      n_lost++;
+		    if (!dnsfilter_reply (vm, dm, b[0], &q))
+		      {
+			verdict = DNSFILTER_VERDICT_DROP;
+			dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_REPLY_FAILED);
+			goto done;
+		      }
+		    vnet_buffer (b[0])->sw_if_index[VLIB_TX] = rx;
+		    next[0] = DNSFILTER_NEXT_OUTPUT;
+		    verdict = DNSFILTER_VERDICT_BLOCK;
+		    dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_BLOCKED);
+		    goto done;
+		  }
+	      }
+	  }
+	if (!inspect)
+	  {
+	    dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_PASSED);
+	    goto done;
+	  }
+	if (!dm->daemon_ok)
+	  {
+	    verdict = DNSFILTER_VERDICT_BYPASS;
+	    dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_DAEMON_DOWN);
+	    goto done;
+	  }
+      }
       if ((dm->global_qps && dnsfilter_global_over (dm, now)) ||
 	  !dnsfilter_remember (dm,
 			       dnsfilter_key (ip->src_address.as_u32, sport,
@@ -342,6 +675,19 @@ VLIB_NODE_FN (dnsfilter_lan_node)
     }
 
   vlib_buffer_enqueue_to_next (vm, node, from, nexts, frame->n_vectors);
+
+  if (n_evs)
+    {
+      vnet_hw_interface_t *hw =
+	vnet_get_sup_hw_interface (dm->vnet_main, dm->events_sw_if_index);
+      vlib_frame_t *f = vlib_get_frame_to_node (vm, hw->output_node_index);
+      clib_memcpy_fast (vlib_frame_vector_args (f), evs, n_evs * sizeof (u32));
+      f->n_vectors = n_evs;
+      vlib_put_frame_to_node (vm, hw->output_node_index, f);
+    }
+  if (n_lost)
+    vlib_increment_simple_counter (&dm->counters[DNSFILTER_CNT_FP_EVENT_LOST],
+				   vm->thread_index, 0, n_lost);
   return frame->n_vectors;
 }
 

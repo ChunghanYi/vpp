@@ -9,11 +9,15 @@
  *   dnsfilter tap <if> host-mac <mac> | dnsfilter tap none
  *   dnsfilter config [intercept on|off] [dot on|off] [doh on|off]
  *                    [client-qps <n>] [global-qps <n>]
+ *                    [fastpath on|off] [cat-mask <n>] [block-ttl <n>]
+ *   dnsfilter blocklist load <file> max <n> | dnsfilter blocklist clear
+ *   dnsfilter events output <if> | dnsfilter events none
  *   dnsfilter health up|down
  *   dnsfilter doh-ip load <file> | dnsfilter doh-ip clear
  *   dnsfilter exempt set [<ip> ...]   (replaces the set; none = empty)
  *   dnsfilter reset
  *   show dnsfilter
+ *   show dnsfilter clients [top <n>] [peek]
  */
 
 #include <vlib/vlib.h>
@@ -23,6 +27,9 @@
 #include <vnet/l2/l2_input.h>
 #include <vnet/l2/l2_in_out_feat_arc.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <vppinfra/time.h>
 #include <vpp/app/version.h>
 #include <dnsfilter/dnsfilter.h>
 
@@ -100,6 +107,40 @@ dnsfilter_client_stale (clib_bihash_kv_8_8_t *kv, void *arg)
   return BIHASH_WALK_CONTINUE;
 }
 
+/* Client stats idle for DNSFILTER_ACTIVE_SEC (unix seconds). */
+static int
+dnsfilter_stats_stale (clib_bihash_kv_8_16_t *kv, void *arg)
+{
+  dnsfilter_sweep_ctx_t *ctx = arg;
+  if (kv->value[1] + DNSFILTER_ACTIVE_SEC < ctx->now)
+    vec_add1 (ctx->stale, kv->key);
+  return BIHASH_WALK_CONTINUE;
+}
+
+static void
+dnsfilter_stats_sweep (dnsfilter_main_t *dm)
+{
+  dnsfilter_sweep_ctx_t ctx = { .now = (u32) unix_time_now () };
+  dnsfilter_per_thread_t *pt;
+  u64 *k;
+
+  vec_foreach (pt, dm->per_thread)
+    {
+      if (!pt->n_stats)
+	continue;
+      clib_bihash_foreach_key_value_pair_8_16 (&pt->stats,
+					       dnsfilter_stats_stale, &ctx);
+      vec_foreach (k, ctx.stale)
+	{
+	  clib_bihash_kv_8_16_t kv = { .key = *k };
+	  if (clib_bihash_add_del_8_16 (&pt->stats, &kv, 0) == 0)
+	    clib_atomic_fetch_sub (&pt->n_stats, 1);
+	}
+      vec_reset_length (ctx.stale);
+    }
+  vec_free (ctx.stale);
+}
+
 static void
 dnsfilter_sweep (vlib_main_t *vm, dnsfilter_main_t *dm)
 {
@@ -146,6 +187,12 @@ dnsfilter_sweep_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
       vlib_process_get_events (vm, 0);
       if (dm->n_ret || dm->n_clients)
 	dnsfilter_sweep (vm, dm);
+      if (dm->per_thread &&
+	  vlib_time_now (vm) - dm->stats_swept >= DNSFILTER_STATS_SWEEP_SEC)
+	{
+	  dm->stats_swept = vlib_time_now (vm);
+	  dnsfilter_stats_sweep (dm);
+	}
     }
   return 0;
 }
@@ -299,6 +346,12 @@ dnsfilter_config_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	dm->client_qps = n;
       else if (unformat (input, "global-qps %u", &n))
 	dm->global_qps = n;
+      else if (dnsfilter_on_off (input, "fastpath", &dm->fastpath))
+	;
+      else if (unformat (input, "cat-mask %u", &n))
+	dm->cat_mask = n;
+      else if (unformat (input, "block-ttl %u", &n))
+	dm->block_ttl = n;
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);
@@ -422,6 +475,284 @@ done:
   return e;
 }
 
+/* ─── Fast path: block table ────────────────────────────────────────── */
+
+/* dnsfilter_block_swap: t (0 = none) becomes the current table under the
+ * worker barrier; the previous one is freed after it (no worker can still
+ * hold it: they only read dm->block at the start of a frame). */
+static void
+dnsfilter_block_swap (dnsfilter_main_t *dm, clib_bihash_8_8_t *t, u32 n)
+{
+  vlib_main_t *vm = vlib_get_main ();
+  clib_bihash_8_8_t *old;
+  int barrier = vlib_get_n_threads () > 1 && !vlib_worker_thread_barrier_held ();
+
+  if (barrier)
+    vlib_worker_thread_barrier_sync (vm);
+  old = dm->block;
+  dm->block = t;
+  dm->block_entries = n;
+  dm->block_loaded_at = t ? unix_time_now () : 0;
+  if (barrier)
+    vlib_worker_thread_barrier_release (vm);
+  if (old)
+    {
+      clib_bihash_free_8_8 (old);
+      clib_mem_free (old);
+    }
+}
+
+/* dnsfilter blocklist load <file> max <n>: a new table from virtserver's
+ * file, built beside the current one while the workers keep judging with
+ * it, then swapped in (an mp-safe command: only the swap stops them). */
+static clib_error_t *
+dnsfilter_blocklist_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				vlib_cli_command_t *cmd)
+{
+  dnsfilter_main_t *dm = &dnsfilter_main;
+  clib_error_t *e = 0;
+  u8 *path = 0, *buf = 0;
+  u32 max = 0, count, i, nbuckets;
+  clib_bihash_8_8_t *t;
+  struct stat st;
+  int fd = -1;
+
+  if (unformat (input, "clear"))
+    {
+      dnsfilter_block_swap (dm, 0, 0);
+      return 0;
+    }
+  if (!unformat (input, "load %s max %u", &path, &max) || !max)
+    return clib_error_return (0, "specify load <file> max <n> or clear");
+  vec_add1 (path, 0);
+  fd = open ((char *) path, O_RDONLY);
+  if (fd < 0 || fstat (fd, &st) < 0 || st.st_size < DNSFILTER_HASH_HDR)
+    {
+      e = clib_error_return_unix (0, "open '%s'", (char *) path);
+      goto done;
+    }
+  vec_validate (buf, st.st_size - 1);
+  if (read (fd, buf, st.st_size) != st.st_size ||
+      memcmp (buf, DNSFILTER_HASH_MAGIC, 8))
+    {
+      e = clib_error_return (0, "%s: not a block table file", path);
+      goto done;
+    }
+  count = clib_little_to_host_u32 (*(u32 *) (buf + 8));
+  if (count > max)
+    {
+      e = clib_error_return (0, "%u entries, more than the maximum %u", count,
+			     max);
+      goto done;
+    }
+  if ((u64) DNSFILTER_HASH_HDR + (u64) count * DNSFILTER_HASH_REC >
+      (u64) st.st_size)
+    {
+      e = clib_error_return (0, "%s: short file", path);
+      goto done;
+    }
+  /* ~4 entries per bucket; the arena (address space, filled on use) with
+   * room to spare: a bihash out of memory takes VPP down. */
+  nbuckets = 1 << max_log2 (clib_max (count / 4, 1024));
+  t = clib_mem_alloc (sizeof (*t));
+  clib_memset (t, 0, sizeof (*t));
+  clib_bihash_init_8_8 (t, "dnsfilter block", nbuckets,
+			(uword) count * 96 + (64 << 20));
+  for (i = 0; i < count; i++)
+    {
+      u8 *r = buf + DNSFILTER_HASH_HDR + (uword) i * DNSFILTER_HASH_REC;
+      clib_bihash_kv_8_8_t kv = {
+	.key = clib_little_to_host_u64 (*(u64 *) r),
+	.value = clib_little_to_host_u32 (*(u32 *) (r + 8)),
+      };
+      clib_bihash_add_del_8_8 (t, &kv, 1);
+    }
+  dnsfilter_block_swap (dm, t, count);
+  vlib_cli_output (vm, "block table loaded: %u entries", count);
+done:
+  if (fd >= 0)
+    close (fd);
+  vec_free (path);
+  vec_free (buf);
+  return e;
+}
+
+/* dnsfilter events output <if> | none: where the "DNF1" frames go (the
+ * memif shared with ETA). */
+static clib_error_t *
+dnsfilter_events_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			     vlib_cli_command_t *cmd)
+{
+  dnsfilter_main_t *dm = &dnsfilter_main;
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 sw_if_index = ~0;
+
+  if (unformat (input, "none"))
+    {
+      dm->events_sw_if_index = ~0;
+      return 0;
+    }
+  if (!unformat (input, "output %U", unformat_vnet_sw_interface, vnm,
+		 &sw_if_index))
+    return clib_error_return (0, "specify output <interface> or none");
+  dm->events_sw_if_index = sw_if_index;
+  return 0;
+}
+
+/* ─── Fast path: client counts ──────────────────────────────────────── */
+
+static void
+dnsfilter_stats_reset (dnsfilter_main_t *dm)
+{
+  dnsfilter_per_thread_t *pt;
+  vec_foreach (pt, dm->per_thread)
+    {
+      clib_bihash_free_8_16 (&pt->stats);
+      clib_bihash_init_8_16 (&pt->stats, "dnsfilter client stats",
+			     DNSFILTER_STATS_BUCKETS, DNSFILTER_STATS_MEMORY);
+      pt->n_stats = 0;
+    }
+  hash_free (dm->clients_prev);
+  dm->clients_prev = 0;
+  dm->clients_prev_valid = 0;
+}
+
+typedef struct
+{
+  uword *total; /* client ip -> queries (all workers) */
+  uword *last;	/* client ip -> last unix second */
+} dnsfilter_clients_ctx_t;
+
+static int
+dnsfilter_clients_add (clib_bihash_kv_8_16_t *kv, void *arg)
+{
+  dnsfilter_clients_ctx_t *ctx = arg;
+  uword *p = hash_get (ctx->total, kv->key);
+  hash_set (ctx->total, kv->key, (p ? p[0] : 0) + kv->value[0]);
+  p = hash_get (ctx->last, kv->key);
+  if (!p || p[0] < kv->value[1])
+    hash_set (ctx->last, kv->key, kv->value[1]);
+  return BIHASH_WALK_CONTINUE;
+}
+
+/* dnsfilter_clients_collect: every worker's counts summed per client. */
+static void
+dnsfilter_clients_collect (dnsfilter_main_t *dm, dnsfilter_clients_ctx_t *ctx)
+{
+  dnsfilter_per_thread_t *pt;
+  ctx->total = hash_create (0, sizeof (uword));
+  ctx->last = hash_create (0, sizeof (uword));
+  vec_foreach (pt, dm->per_thread)
+    if (pt->n_stats)
+      clib_bihash_foreach_key_value_pair_8_16 (&pt->stats,
+					       dnsfilter_clients_add, ctx);
+}
+
+/* dnsfilter_active_clients: clients with a query in the last hour. */
+static u32
+dnsfilter_active_clients (dnsfilter_main_t *dm, u32 *tracked)
+{
+  dnsfilter_clients_ctx_t ctx;
+  u32 now = (u32) unix_time_now (), n = 0;
+  uword k, v;
+
+  dnsfilter_clients_collect (dm, &ctx);
+  hash_foreach (k, v, ctx.last, ({
+		  if (v + DNSFILTER_ACTIVE_SEC >= now)
+		    n++;
+		}));
+  *tracked = hash_elts (ctx.total);
+  hash_free (ctx.total);
+  hash_free (ctx.last);
+  return n;
+}
+
+/* show dnsfilter clients [top <n>] [peek]: the n busiest clients by the
+ * queries since the previous (non-peek) reading, the rest as others, and
+ * the clients active in the last hour — "key: value" lines, as
+ * xdp_bridge's dnsf-client-top (first: 1 = no previous reading, the
+ * counts are since the start). */
+static clib_error_t *
+show_dnsfilter_clients_command_fn (vlib_main_t *vm, unformat_input_t *input,
+				   vlib_cli_command_t *cmd)
+{
+  dnsfilter_main_t *dm = &dnsfilter_main;
+  dnsfilter_clients_ctx_t ctx;
+  u32 top_n = 10, peek = 0, now = (u32) unix_time_now (), active = 0, i;
+  u32 top_key[DNSFILTER_TOP_MAX], n_top = 0;
+  u64 top_val[DNSFILTER_TOP_MAX], sum = 0, topsum = 0;
+  uword k, v;
+  int first = !dm->clients_prev_valid;
+
+  while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "top %u", &top_n))
+	;
+      else if (unformat (input, "peek"))
+	peek = 1;
+      else
+	return clib_error_return (0, "unknown input '%U'",
+				  format_unformat_error, input);
+    }
+  if (top_n < 1 || top_n > DNSFILTER_TOP_MAX)
+    top_n = DNSFILTER_TOP_MAX;
+
+  dnsfilter_clients_collect (dm, &ctx);
+  hash_foreach (k, v, ctx.total, ({
+		  uword *pv = hash_get (ctx.last, k);
+		  u64 d = v;
+		  if (pv && pv[0] + DNSFILTER_ACTIVE_SEC >= now)
+		    active++;
+		  if (!first)
+		    {
+		      uword *pp = hash_get (dm->clients_prev, k);
+		      if (pp && pp[0] <= v)
+			d -= pp[0];
+		    }
+		  if (d)
+		    {
+		      u32 pos = n_top, j;
+		      sum += d;
+		      while (pos > 0 && top_val[pos - 1] < d)
+			pos--;
+		      if (pos < top_n)
+			{
+			  j = n_top < top_n ? n_top : top_n - 1;
+			  for (; j > pos; j--)
+			    {
+			      top_key[j] = top_key[j - 1];
+			      top_val[j] = top_val[j - 1];
+			    }
+			  top_key[pos] = (u32) k;
+			  top_val[pos] = d;
+			  if (n_top < top_n)
+			    n_top++;
+			}
+		    }
+		}));
+  for (i = 0; i < n_top; i++)
+    {
+      ip4_address_t a = { .as_u32 = top_key[i] };
+      vlib_cli_output (vm, "client: %U %llu", format_ip4_address, &a,
+		       top_val[i]);
+      topsum += top_val[i];
+    }
+  vlib_cli_output (vm, "others: %llu", sum - topsum);
+  vlib_cli_output (vm, "active_1h: %u", active);
+  vlib_cli_output (vm, "tracked: %u", hash_elts (ctx.total));
+  vlib_cli_output (vm, "first: %d", first);
+  if (!peek)
+    {
+      hash_free (dm->clients_prev);
+      dm->clients_prev = ctx.total;
+      dm->clients_prev_valid = 1;
+      ctx.total = 0;
+    }
+  hash_free (ctx.total);
+  hash_free (ctx.last);
+  return 0;
+}
+
 /* dnsfilter reset: everything off and empty (DNS Sinkhole taken down). */
 static clib_error_t *
 dnsfilter_reset_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -437,6 +768,10 @@ dnsfilter_reset_command_fn (vlib_main_t *vm, unformat_input_t *input,
   dm->intercept = dm->daemon_ok = dm->block_dot = dm->block_doh_ip = 0;
   dm->client_qps = dm->global_qps = 0;
   dnsfilter_tables_reset (dm);
+  dm->fastpath = 0;
+  dnsfilter_block_swap (dm, 0, 0);
+  dm->events_sw_if_index = ~0;
+  dnsfilter_stats_reset (dm);
   return 0;
 }
 
@@ -473,6 +808,21 @@ show_dnsfilter_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vlib_cli_output (vm, "tracked_clients: %u", dm->n_clients);
   vlib_cli_output (vm, "doh_addresses: %u", dm->n_doh_ips);
   vlib_cli_output (vm, "exempt_clients: %u", dm->n_exempt);
+  {
+    u32 tracked = 0, active = dnsfilter_active_clients (dm, &tracked);
+    vlib_cli_output (vm, "fastpath: %u", dm->fastpath);
+    vlib_cli_output (vm, "cat_mask: %u", dm->cat_mask);
+    vlib_cli_output (vm, "block_ttl: %u", dm->block_ttl);
+    vlib_cli_output (vm, "block_entries: %u", dm->block ? dm->block_entries : 0);
+    vlib_cli_output (vm, "block_loaded_at: %lld",
+		     (long long) dm->block_loaded_at);
+    if (dm->events_sw_if_index != ~0)
+      vlib_cli_output (vm, "events: %U", format_vnet_sw_if_index_name, vnm,
+		       dm->events_sw_if_index);
+    else
+      vlib_cli_output (vm, "events: -");
+    vlib_cli_output (vm, "active_clients: %u", active);
+  }
   return 0;
 }
 
@@ -516,6 +866,29 @@ VLIB_CLI_COMMAND (dnsfilter_exempt_command, static) = {
   .function = dnsfilter_exempt_command_fn,
 };
 
+VLIB_CLI_COMMAND (dnsfilter_blocklist_command, static) = {
+  .path = "dnsfilter blocklist",
+  .short_help = "dnsfilter blocklist load <file> max <n> | dnsfilter blocklist clear",
+  .function = dnsfilter_blocklist_command_fn,
+  .is_mp_safe = 1,
+};
+
+/* Barrier: a worker must not put a frame to an interface going away. */
+VLIB_CLI_COMMAND (dnsfilter_events_command, static) = {
+  .path = "dnsfilter events",
+  .short_help = "dnsfilter events output <interface> | dnsfilter events none",
+  .function = dnsfilter_events_command_fn,
+};
+
+/* Main thread only: the workers' tables are read (bihash readers run
+ * beside their writer) and the previous totals are the main thread's. */
+VLIB_CLI_COMMAND (show_dnsfilter_clients_command, static) = {
+  .path = "show dnsfilter clients",
+  .short_help = "show dnsfilter clients [top <n>] [peek]",
+  .function = show_dnsfilter_clients_command_fn,
+  .is_mp_safe = 1,
+};
+
 VLIB_CLI_COMMAND (dnsfilter_reset_command, static) = {
   .path = "dnsfilter reset",
   .short_help = "dnsfilter reset",
@@ -540,6 +913,9 @@ dnsfilter_init (vlib_main_t *vm)
   dm->vlib_main = vm;
   dm->vnet_main = vnet_get_main ();
   dm->tap_sw_if_index = ~0;
+  dm->events_sw_if_index = ~0;
+  dm->block_ttl = 60;
+  dm->cat_mask = DNSFILTER_CAT_BITS;
   dnsfilter_tables_init (dm);
   for (i = 0; i < DNSFILTER_N_COUNTER; i++)
     {
@@ -553,6 +929,23 @@ dnsfilter_init (vlib_main_t *vm)
 }
 
 VLIB_INIT_FUNCTION (dnsfilter_init);
+
+/* The workers exist only now: one fast path state each. */
+static clib_error_t *
+dnsfilter_main_loop_enter (vlib_main_t *vm)
+{
+  dnsfilter_main_t *dm = &dnsfilter_main;
+  dnsfilter_per_thread_t *pt;
+
+  vec_validate_aligned (dm->per_thread, vlib_get_n_threads () - 1,
+			CLIB_CACHE_LINE_BYTES);
+  vec_foreach (pt, dm->per_thread)
+    clib_bihash_init_8_16 (&pt->stats, "dnsfilter client stats",
+			   DNSFILTER_STATS_BUCKETS, DNSFILTER_STATS_MEMORY);
+  return 0;
+}
+
+VLIB_MAIN_LOOP_ENTER_FUNCTION (dnsfilter_main_loop_enter);
 
 VLIB_PLUGIN_REGISTER () = {
   .version = VPP_BUILD_VER,
