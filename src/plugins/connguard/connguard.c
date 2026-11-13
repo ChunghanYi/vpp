@@ -304,7 +304,8 @@ connguard_csum (const u8 *p, uword len, u32 sum)
  * interface the server is behind — see xdp_bridge_daemon.c's af_send_rst
  * for the reasoning. Its RX interface is set to that same LAN interface,
  * so connguard-out (which only records packets received on a WAN
- * interface) lets it straight through. */
+ * interface) lets it straight through. On a VLAN trunk link it carries the
+ * connection's tags (cold->tags). */
 static int
 connguard_send_rst (vlib_main_t *vm, connguard_main_t *cm,
 		    const connguard_conn_t *c, const connguard_conn_cold_t *cold)
@@ -321,14 +322,17 @@ connguard_send_rst (vlib_main_t *vm, connguard_main_t *cm,
 
   vlib_buffer_t *b = vlib_get_buffer (vm, bi);
   u8 *f = vlib_buffer_get_current (b);
-  clib_memset (f, 0, 60);
+  u32 l2 = 14 + (cold->tags[0] ? 4 : 0) + (cold->tags[1] ? 4 : 0);
+  u32 flen = clib_max (60, l2 + 40);
+  clib_memset (f, 0, flen);
 
   clib_memcpy_fast (f, cold->dst_mac, 6);
   clib_memcpy_fast (f + 6, cold->src_mac, 6);
-  f[12] = 0x08;
-  f[13] = 0x00;
+  clib_memcpy_fast (f + 12, cold->tags, l2 - 14);
+  f[l2 - 2] = 0x08;
+  f[l2 - 1] = 0x00;
 
-  u8 *ip = f + 14;
+  u8 *ip = f + l2;
   u16 id = (u16) random_u32 (&cm->rand_seed);
   ip[0] = 0x45;
   ip[3] = 40; /* total length */
@@ -368,7 +372,7 @@ connguard_send_rst (vlib_main_t *vm, connguard_main_t *cm,
   tcp[16] = tc >> 8;
   tcp[17] = tc & 0xff;
 
-  b->current_length = 60;
+  b->current_length = flen;
   vnet_buffer (b)->sw_if_index[VLIB_RX] = sw_if_index;
   vnet_buffer (b)->sw_if_index[VLIB_TX] = sw_if_index;
 

@@ -5,7 +5,8 @@
  *
  *   dnsfilter-lan — l2-input-ip4 arc of each LAN port, after the input ACL
  *   (attacker blocklist, WAN policy) like xdp_bridge's stage after its
- *   mitigation. Untagged IPv4, first fragment, toward the WAN (destination
+ *   mitigation. IPv4 (untagged or behind one or two VLAN tags, l2_len),
+ *   first fragment, toward the WAN (destination
  *   MAC unknown in the bridge domain or learned on a WAN port; never the
  *   BVI, never a LAN port — a LAN-side DNS server keeps its queries):
  *     dport 853, block_dot             -> drop (dot_dropped)
@@ -20,9 +21,10 @@
  *       no intercept (Fast mode)       -> bridged (fp_passed)
  *       engine not answering           -> bridged (bypass_daemon_down)
  *       over the global qps / table full -> bridged (bypass_global_limit)
- *       else                           -> return entry stored, destination
- *                                         MAC = the tap's Linux end, sent
- *                                         to the tap (redirected)
+ *       else                           -> return entry stored (with the
+ *                                         VLAN tags, taken off the frame),
+ *                                         destination MAC = the tap's Linux
+ *                                         end, sent to the tap (redirected)
  *     (without fastpath the engine's health is checked first, as before)
  *   Everything else continues on the arc untouched: the cost for non-DNS
  *   traffic is the protocol/port test.
@@ -32,15 +34,15 @@
  *   (Linux routes them out of the tap toward a fixed neighbour, see
  *   virtserver/dnsf/linux.go). Source port 53 and a return entry for
  *   (destination ip, port, proto): MACs restored (source = the client's
- *   gateway, destination = the client) and sent straight out of the LAN
- *   port the query came in on (returned). Anything else from the tap is
+ *   gateway, destination = the client), the query's VLAN tags put back,
+ *   and sent straight out of the LAN port the query came in on (returned). Anything else from the tap is
  *   dropped (return_dropped) — nothing from the host side may enter the
  *   bridge.
  *
  * The answers bypass the bridge (interface-output), as floodguard's SYN
  * challenge replies do: they are the resolver's answer on the ingress
- * port, not bridged traffic. Same scope as the kernel mode: IPv4 only,
- * untagged frames only.
+ * port, not bridged traffic. Same scope as the kernel mode: IPv4 only;
+ * a VLAN trunk link's tags (up to two) are kept on every answer.
  */
 
 #include <vlib/vlib.h>
@@ -192,14 +194,14 @@ dnsfilter_global_over (dnsfilter_main_t *dm, u32 now)
 /* dnsfilter_remember: stores / refreshes the client's return entry;
  * 0 = the table is full (the query is bridged unfiltered). */
 static_always_inline int
-dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth,
+dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth, u32 l2_len,
 		    u32 sw_if_index, u32 now)
 {
-  clib_bihash_kv_8_16_t kv, val;
+  clib_bihash_kv_8_24_t kv, val;
   dnsfilter_ret_t r;
 
   kv.key = key;
-  if (clib_bihash_search_8_16 (&dm->ret, &kv, &val))
+  if (clib_bihash_search_8_24 (&dm->ret, &kv, &val))
     {
       if (dm->n_ret >= DNSFILTER_RET_MAX)
 	return 0;
@@ -209,9 +211,12 @@ dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth,
   clib_memcpy_fast (r.gw_mac, eth, 6);
   r.sw_if_index = (u16) sw_if_index;
   r.seen = (u16) now;
+  r.tags[0] = r.tags[1] = 0;
+  clib_memcpy_fast (r.tags, eth + 12, l2_len - sizeof (ethernet_header_t));
   kv.value[0] = r.as_u64[0];
   kv.value[1] = r.as_u64[1];
-  clib_bihash_add_del_8_16 (&dm->ret, &kv, 1 /* add/replace */);
+  kv.value[2] = r.as_u64[2];
+  clib_bihash_add_del_8_24 (&dm->ret, &kv, 1 /* add/replace */);
   return 1;
 }
 
@@ -230,8 +235,9 @@ typedef struct
   u32 cats; /* the blocking bits */
 } dnsfilter_query_t;
 
-#define DNSFILTER_DNS_OFF                                                     \
-  (sizeof (ethernet_header_t) + sizeof (ip4_header_t) + sizeof (udp_header_t))
+/* the DNS header's offset behind an L2 header of l2 bytes */
+#define DNSFILTER_DNS_OFF(l2)                                                 \
+  ((l2) + sizeof (ip4_header_t) + sizeof (udp_header_t))
 
 /* dnsfilter_parse: 1 for a query the fast path judges — an option-less
  * IPv4 header, a standard query (QR 0, OPCODE 0) with exactly one
@@ -321,15 +327,17 @@ dnsfilter_judge (dnsfilter_main_t *dm, clib_bihash_8_8_t *t,
  * NXDOMAIN-bit name -> NXDOMAIN; everything after the question goes, a
  * query with an additional record (EDNS) gets a minimal OPT back. No room
  * in the buffer for the record: NXDOMAIN (fp_nxdomain). Returns 0 when no
- * answer could be built. The caller sends it back out of the RX port. */
+ * answer could be built. The caller sends it back out of the RX port. The
+ * VLAN tags between the MACs and the IPv4 header (l2 bytes in all) stay
+ * as they are: the answer goes back on the client's VLAN. */
 static_always_inline int
 dnsfilter_reply (vlib_main_t *vm, dnsfilter_main_t *dm, vlib_buffer_t *b,
-		 dnsfilter_query_t *q)
+		 u32 l2, dnsfilter_query_t *q)
 {
   u8 *eth = vlib_buffer_get_current (b);
-  ip4_header_t *ip = (ip4_header_t *) (eth + sizeof (ethernet_header_t));
+  ip4_header_t *ip = (ip4_header_t *) (eth + l2);
   udp_header_t *udp = (udp_header_t *) (ip + 1);
-  u8 *dns = eth + DNSFILTER_DNS_OFF, *p, mac[6];
+  u8 *dns = eth + DNSFILTER_DNS_OFF (l2), *p, mac[6];
   u32 ans = 0, opt = q->has_opt ? 11 : 0, qend, total, room, ttl;
   u8 rcode = 0;
   u32 a;
@@ -341,7 +349,7 @@ dnsfilter_reply (vlib_main_t *vm, dnsfilter_main_t *dm, vlib_buffer_t *b,
     ans = 16;
   else if (q->qclass == 1 && q->qtype == 28)
     ans = 28;
-  qend = DNSFILTER_DNS_OFF + 12 + q->name_len + 1 + 4;
+  qend = DNSFILTER_DNS_OFF (l2) + 12 + q->name_len + 1 + 4;
   total = qend + ans + opt;
   room = vlib_buffer_get_default_data_size (vm) - b->current_data;
   if (total > room)
@@ -362,7 +370,7 @@ dnsfilter_reply (vlib_main_t *vm, dnsfilter_main_t *dm, vlib_buffer_t *b,
   a = ip->src_address.as_u32;
   ip->src_address.as_u32 = ip->dst_address.as_u32;
   ip->dst_address.as_u32 = a;
-  ip->length = clib_host_to_net_u16 (total - sizeof (ethernet_header_t));
+  ip->length = clib_host_to_net_u16 (total - l2);
   ip->ttl = 64;
   ip->flags_and_fragment_offset = 0;
   ip->checksum = ip4_header_checksum (ip);
@@ -370,8 +378,7 @@ dnsfilter_reply (vlib_main_t *vm, dnsfilter_main_t *dm, vlib_buffer_t *b,
   port = udp->src_port;
   udp->src_port = udp->dst_port;
   udp->dst_port = port;
-  udp->length = clib_host_to_net_u16 (total - sizeof (ethernet_header_t) -
-				      sizeof (ip4_header_t));
+  udp->length = clib_host_to_net_u16 (total - l2 - sizeof (ip4_header_t));
   udp->checksum = 0;
 
   dns[2] = 0x80 | (dns[2] & 0x01); /* QR, RD as asked */
@@ -502,6 +509,7 @@ VLIB_NODE_FN (dnsfilter_lan_node)
     {
       u8 *eth = vlib_buffer_get_current (b[0]);
       u8 *end = eth + b[0]->current_length;
+      u32 l2 = vnet_buffer (b[0])->l2.l2_len;
       ip4_header_t *ip;
       u8 *l4;
       u16 sport, dport = 0;
@@ -513,11 +521,11 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 
       vnet_feature_next_u16 (next, b[0]);
 
-      /* untagged IPv4 TCP/UDP, first fragment, to a unicast MAC */
-      if (vnet_buffer (b[0])->l2.l2_len != sizeof (ethernet_header_t) ||
-	  (eth[0] & 1))
+      /* IPv4 (at most two VLAN tags) TCP/UDP, first fragment, to a
+       * unicast MAC */
+      if (!dnsfilter_l2_len_ok (l2) || (eth[0] & 1))
 	goto done;
-      ip = (ip4_header_t *) (eth + sizeof (ethernet_header_t));
+      ip = (ip4_header_t *) (eth + l2);
       if ((u8 *) (ip + 1) > end)
 	goto done;
       proto = ip->protocol;
@@ -619,7 +627,7 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 		    if (!dnsfilter_event (vm, dm, pt, &q, rx, client, unix_now,
 					  evs, &n_evs))
 		      n_lost++;
-		    if (!dnsfilter_reply (vm, dm, b[0], &q))
+		    if (!dnsfilter_reply (vm, dm, b[0], l2, &q))
 		      {
 			verdict = DNSFILTER_VERDICT_DROP;
 			dnsfilter_count (vm, dm, DNSFILTER_CNT_FP_REPLY_FAILED);
@@ -649,12 +657,21 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	  !dnsfilter_remember (dm,
 			       dnsfilter_key (ip->src_address.as_u32, sport,
 					      proto),
-			       eth, vnet_buffer (b[0])->sw_if_index[VLIB_RX],
+			       eth, l2, vnet_buffer (b[0])->sw_if_index[VLIB_RX],
 			       now))
 	{
 	  verdict = DNSFILTER_VERDICT_BYPASS;
 	  dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_GLOBAL_LIMIT);
 	  goto done;
+	}
+      if (l2 != sizeof (ethernet_header_t))
+	{
+	  /* the tap's Linux end has no VLAN: the tags (saved in the return
+	   * entry) come off, the MACs move up over them */
+	  u32 n = l2 - sizeof (ethernet_header_t);
+	  memmove (eth + n, eth, 12);
+	  vlib_buffer_advance (b[0], n);
+	  eth += n;
 	}
       clib_memcpy_fast (eth, dm->host_mac.bytes, 6);
       vnet_buffer (b[0])->sw_if_index[VLIB_TX] = dm->tap_sw_if_index;
@@ -708,7 +725,7 @@ VLIB_NODE_FN (dnsfilter_return_node)
       u8 *end = eth + b[0]->current_length;
       ethernet_header_t *e = (ethernet_header_t *) eth;
       ip4_header_t *ip = (ip4_header_t *) (e + 1);
-      clib_bihash_kv_8_16_t kv, val;
+      clib_bihash_kv_8_24_t kv, val;
       dnsfilter_ret_t r;
       u8 *l4;
 
@@ -725,17 +742,27 @@ VLIB_NODE_FN (dnsfilter_return_node)
 	goto miss;
       kv.key = dnsfilter_key (ip->dst_address.as_u32,
 			      ((udp_header_t *) l4)->dst_port, ip->protocol);
-      if (clib_bihash_search_8_16 (&dm->ret, &kv, &val))
+      if (clib_bihash_search_8_24 (&dm->ret, &kv, &val))
 	goto miss;
       r.as_u64[0] = val.value[0];
       r.as_u64[1] = val.value[1];
+      r.as_u64[2] = val.value[2];
+      if (r.tags[0])
+	{
+	  /* the query's VLAN tags go back in front of the ethertype; the
+	   * buffer's headroom takes them */
+	  u32 n = r.tags[1] ? 8 : 4;
+	  vlib_buffer_advance (b[0], -(word) n);
+	  e = vlib_buffer_get_current (b[0]);
+	  clib_memcpy_fast ((u8 *) e + 12, r.tags, n);
+	}
       clib_memcpy_fast (e->dst_address, r.client_mac, 6);
       clib_memcpy_fast (e->src_address, r.gw_mac, 6);
       vnet_buffer (b[0])->sw_if_index[VLIB_TX] = r.sw_if_index;
       /* A UDP query has exactly one answer: free its entry now (a TCP
        * connection keeps it for the next query, the sweep ends it). */
       if (ip->protocol == IP_PROTOCOL_UDP &&
-	  clib_bihash_add_del_8_16 (&dm->ret, &kv, 0 /* del */) == 0)
+	  clib_bihash_add_del_8_24 (&dm->ret, &kv, 0 /* del */) == 0)
 	clib_atomic_fetch_sub (&dm->n_ret, 1);
       next[0] = DNSFILTER_NEXT_OUTPUT;
       dnsfilter_count (vm, dm, DNSFILTER_CNT_RETURNED);

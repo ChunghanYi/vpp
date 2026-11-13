@@ -34,6 +34,10 @@
  *
  * Each copy gets an eta_frame_hdr_t in front (headroom), telling etad the
  * receive interface and whether it is a WAN-role (inbound) one.
+ *
+ * VLAN: the IPv4 header may sit behind one or two 802.1Q / 802.1ad tags
+ * (a VLAN trunk link; the bridge keeps the tags). The copy is the whole
+ * frame, tags included — libmerc reads them, as with xdp_bridge's copies.
  */
 
 #include <vlib/vlib.h>
@@ -89,9 +93,31 @@ eta_take_token (eta_main_t *em, eta_per_thread_t *pt, f64 now, u32 *n_limited)
   return 1;
 }
 
+/* eta_l3_offset: where the IPv4 header of the Ethernet frame p starts —
+ * behind at most two VLAN tags — or 0 when it is not IPv4. */
+static_always_inline u32
+eta_l3_offset (u8 *p, u32 len)
+{
+  u16 type = ((ethernet_header_t *) p)->type;
+  u32 off = sizeof (ethernet_header_t), i;
+
+  if (PREDICT_TRUE (type == clib_host_to_net_u16 (ETHERNET_TYPE_IP4)))
+    return off;
+  for (i = 0; i < 2 && (type == clib_host_to_net_u16 (ETHERNET_TYPE_VLAN) ||
+			type == clib_host_to_net_u16 (ETHERNET_TYPE_DOT1AD));
+       i++)
+    {
+      if (off + 4 > len)
+	return 0;
+      type = *(u16 *) (p + off + 2);
+      off += 4;
+    }
+  return type == clib_host_to_net_u16 (ETHERNET_TYPE_IP4) ? off : 0;
+}
+
 /* eta_classify: which kind of ClientHello candidate b is (ETA_KIND_*),
- * from header compares only — the per-packet hot path. Untagged IPv4 only,
- * like the XDP stage. */
+ * from header compares only — the per-packet hot path. IPv4 only, like
+ * the XDP stage. */
 static_always_inline int
 eta_classify (eta_per_thread_t *pt, vlib_buffer_t *b)
 {
@@ -100,11 +126,12 @@ eta_classify (eta_per_thread_t *pt, vlib_buffer_t *b)
 
   if (PREDICT_FALSE (len < sizeof (ethernet_header_t) + sizeof (ip4_header_t)))
     return ETA_KIND_NONE;
-  if (((ethernet_header_t *) p)->type != clib_host_to_net_u16 (ETHERNET_TYPE_IP4))
+  u32 l2 = eta_l3_offset (p, len);
+  if (!l2 || l2 + sizeof (ip4_header_t) > len)
     return ETA_KIND_NONE;
-  ip4_header_t *ip = (ip4_header_t *) (p + sizeof (ethernet_header_t));
+  ip4_header_t *ip = (ip4_header_t *) (p + l2);
   u32 ihl = ip4_header_bytes (ip);
-  u32 off = sizeof (ethernet_header_t) + ihl;
+  u32 off = l2 + ihl;
 
   if (ip->protocol == IP_PROTOCOL_TCP)
     {
@@ -113,7 +140,7 @@ eta_classify (eta_per_thread_t *pt, vlib_buffer_t *b)
       u32 l4 = off + tcp_header_bytes ((tcp_header_t *) (p + off));
       /* no payload (pure ACK etc.), or payload not in this buffer */
       if (l4 >= len ||
-	  clib_net_to_host_u16 (ip->length) + sizeof (ethernet_header_t) <= l4)
+	  clib_net_to_host_u16 (ip->length) + l2 <= l4)
 	return ETA_KIND_NONE;
       if (p[l4] == 0x16)
 	return ETA_KIND_TLS;
@@ -139,7 +166,8 @@ eta_candidate (eta_main_t *em, eta_per_thread_t *pt, vlib_buffer_t *b,
 {
   u8 *p = vlib_buffer_get_current (b);
   u32 len = b->current_length;
-  ip4_header_t *ip = (ip4_header_t *) (p + sizeof (ethernet_header_t));
+  u32 l2 = eta_l3_offset (p, len); /* eta_classify found IPv4 there */
+  ip4_header_t *ip = (ip4_header_t *) (p + l2);
   u32 ihl = ip4_header_bytes (ip);
 
   if (ip4_is_fragment (ip))
@@ -147,7 +175,7 @@ eta_candidate (eta_main_t *em, eta_per_thread_t *pt, vlib_buffer_t *b,
 
   if (kind == ETA_KIND_QUIC)
     {
-      u32 off = sizeof (ethernet_header_t) + ihl + sizeof (udp_header_t);
+      u32 off = l2 + ihl + sizeof (udp_header_t);
       if (off + 5 > len)
 	return 0;
       /* version 0 is Version Negotiation, not an Initial */
@@ -167,7 +195,7 @@ eta_candidate (eta_main_t *em, eta_per_thread_t *pt, vlib_buffer_t *b,
 
   if (kind == ETA_KIND_TLS)
     {
-      u32 off = sizeof (ethernet_header_t) + l4_hlen;
+      u32 off = l2 + l4_hlen;
       if (off + 6 > len)
 	return 0;
       /* 16 03 xx LL LL 01: handshake record, TLS 1.x, ClientHello */
@@ -226,7 +254,8 @@ eta_slow (vlib_main_t *vm, eta_main_t *em, eta_per_thread_t *pt,
     {
       /* only a flow this thread follows */
       u8 *p = vlib_buffer_get_current (b);
-      ip4_header_t *ip = (ip4_header_t *) (p + sizeof (ethernet_header_t));
+      ip4_header_t *ip =
+	(ip4_header_t *) (p + eta_l3_offset (p, b->current_length));
       tcp_header_t *t = (tcp_header_t *) ((u8 *) ip + ip4_header_bytes (ip));
       eta_flow_slot_t *s = &pt->slots[eta_slot_index (
 	ip->src_address.as_u32, ip->dst_address.as_u32,
@@ -260,16 +289,17 @@ eta_slow (vlib_main_t *vm, eta_main_t *em, eta_per_thread_t *pt,
   copies[(*n_copies)++] = vlib_get_buffer_index (vm, c);
 }
 
-/* eta_l2_rewind: how far back the untagged Ethernet header of b starts
- * (eta-ip4: the buffer starts at the IP header), 0 if it is not there. */
+/* eta_l2_rewind: how far back the Ethernet header of b starts (eta-ip4:
+ * the buffer starts at the IP header; an untagged frame or one behind one
+ * or two VLAN tags), 0 if it is not there. */
 static_always_inline word
 eta_l2_rewind (vlib_buffer_t *b)
 {
   if (b->flags & VNET_BUFFER_F_L2_HDR_OFFSET_VALID)
-    return b->current_data - vnet_buffer (b)->l2_hdr_offset ==
-		 sizeof (ethernet_header_t) ?
-	     sizeof (ethernet_header_t) :
-	     0;
+    {
+      word d = b->current_data - vnet_buffer (b)->l2_hdr_offset;
+      return d == 14 || d == 18 || d == 22 ? d : 0;
+    }
   return sizeof (ethernet_header_t);
 }
 

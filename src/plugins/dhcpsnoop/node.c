@@ -77,7 +77,8 @@ dhcpsnoop_frame (vlib_buffer_t *b, ip4_header_t **ipp)
   u32 l2 = vnet_buffer (b)->l2.l2_len;
   ip4_header_t *ip = (ip4_header_t *) (eth + l2);
 
-  if (PREDICT_FALSE ((u8 *) (ip + 1) > end) || ip->protocol != IP_PROTOCOL_UDP)
+  if (PREDICT_FALSE ((u8 *) (ip + 1) > end) || ip->protocol != IP_PROTOCOL_UDP ||
+      ip4_header_bytes (ip) < sizeof (ip4_header_t))
     return 0;
   udp_header_t *udp = (udp_header_t *) ((u8 *) ip + ip4_header_bytes (ip));
   if ((u8 *) (udp + 1) > end)

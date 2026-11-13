@@ -33,6 +33,10 @@
 #include <vpp/app/version.h>
 #include <dnsfilter/dnsfilter.h>
 
+/* the return table's bihash type (dnsfilter_bihash_8_24.h), built here */
+#include <dnsfilter/dnsfilter_bihash_8_24.h>
+#include <vppinfra/bihash_template.c>
+
 dnsfilter_main_t dnsfilter_main;
 
 static const char *const dnsfilter_counter_names[] = {
@@ -58,7 +62,7 @@ dnsfilter_counter_total (dnsfilter_main_t *dm, dnsfilter_counter_t c)
 static void
 dnsfilter_tables_init (dnsfilter_main_t *dm)
 {
-  clib_bihash_init_8_16 (&dm->ret, "dnsfilter return", DNSFILTER_RET_BUCKETS,
+  clib_bihash_init_8_24 (&dm->ret, "dnsfilter return", DNSFILTER_RET_BUCKETS,
 			 DNSFILTER_RET_MEMORY);
   clib_bihash_init_8_8 (&dm->clients, "dnsfilter clients",
 			DNSFILTER_CLIENT_BUCKETS, DNSFILTER_CLIENT_MEMORY);
@@ -73,7 +77,7 @@ dnsfilter_tables_init (dnsfilter_main_t *dm)
 static void
 dnsfilter_tables_reset (dnsfilter_main_t *dm)
 {
-  clib_bihash_free_8_16 (&dm->ret);
+  clib_bihash_free_8_24 (&dm->ret);
   clib_bihash_free_8_8 (&dm->clients);
   clib_bihash_free_8_8 (&dm->doh_ips);
   clib_bihash_free_8_8 (&dm->exempt);
@@ -89,10 +93,11 @@ typedef struct
 } dnsfilter_sweep_ctx_t;
 
 static int
-dnsfilter_ret_stale (clib_bihash_kv_8_16_t *kv, void *arg)
+dnsfilter_ret_stale (clib_bihash_kv_8_24_t *kv, void *arg)
 {
   dnsfilter_sweep_ctx_t *ctx = arg;
-  dnsfilter_ret_t r = { .as_u64 = { kv->value[0], kv->value[1] } };
+  dnsfilter_ret_t r = { .as_u64 = { kv->value[0], kv->value[1],
+				    kv->value[2] } };
   if ((u16) ((u16) ctx->now - r.seen) > DNSFILTER_RET_TTL_SEC)
     vec_add1 (ctx->stale, kv->key);
   return BIHASH_WALK_CONTINUE;
@@ -149,12 +154,12 @@ dnsfilter_sweep (vlib_main_t *vm, dnsfilter_main_t *dm)
 
   if (dm->n_ret)
     {
-      clib_bihash_foreach_key_value_pair_8_16 (&dm->ret, dnsfilter_ret_stale,
+      clib_bihash_foreach_key_value_pair_8_24 (&dm->ret, dnsfilter_ret_stale,
 					       &ctx);
       vec_foreach (k, ctx.stale)
 	{
-	  clib_bihash_kv_8_16_t kv = { .key = *k };
-	  if (clib_bihash_add_del_8_16 (&dm->ret, &kv, 0) == 0)
+	  clib_bihash_kv_8_24_t kv = { .key = *k };
+	  if (clib_bihash_add_del_8_24 (&dm->ret, &kv, 0) == 0)
 	    clib_atomic_fetch_sub (&dm->n_ret, 1);
 	}
       vec_reset_length (ctx.stale);

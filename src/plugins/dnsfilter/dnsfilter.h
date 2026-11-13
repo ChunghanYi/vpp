@@ -28,6 +28,7 @@
 #include <vnet/ethernet/mac_address.h>
 #include <vppinfra/bihash_8_8.h>
 #include <vppinfra/bihash_8_16.h>
+#include <dnsfilter/dnsfilter_bihash_8_24.h>
 
 /* Return table: one entry per outstanding query (client ip, port, proto).
  * A UDP entry is removed when its answer goes back; what is left (TCP,
@@ -155,9 +156,13 @@ typedef enum
   DNSFILTER_ROLE_WAN,
 } dnsfilter_role_t;
 
-/* Return table value (bihash_8_16): the client's MAC, the MAC it sent the
- * query to (its gateway, the answer's source MAC), the LAN port and the
- * last time a query packet refreshed it (seconds, u16 wraps). */
+/* Return table value (dnsfilter_bihash_8_24): the client's MAC, the MAC
+ * it sent the query to (its gateway, the answer's source MAC), the LAN
+ * port, the last time a query packet refreshed it (seconds, u16 wraps)
+ * and the query's VLAN tags as they were on the wire (TPID + TCI each,
+ * 0 = none): the query goes to the tap untagged and its answer gets them
+ * back (xdp_bridge's dnsf_ret_val does the same). */
+#define DNSFILTER_MAX_TAGS 2
 typedef union
 {
   struct
@@ -166,9 +171,18 @@ typedef union
     u8 gw_mac[6];
     u16 sw_if_index; /* LAN port (main interfaces only, < 65536) */
     u16 seen;
+    u32 tags[DNSFILTER_MAX_TAGS];
   };
-  u64 as_u64[2];
+  u64 as_u64[3];
 } dnsfilter_ret_t;
+
+/* L2 header lengths the datapath handles: untagged, one or two 802.1Q /
+ * 802.1ad tags (l2.l2_len, set by ethernet-input for the bridge). */
+always_inline int
+dnsfilter_l2_len_ok (u32 l2_len)
+{
+  return l2_len == 14 || l2_len == 18 || l2_len == 22;
+}
 
 /* Per-worker state of the fast path. */
 typedef struct
@@ -198,7 +212,7 @@ typedef struct
   u32 tap_sw_if_index;
   mac_address_t host_mac;
 
-  clib_bihash_8_16_t ret;	/* (client ip, port, proto) -> dnsfilter_ret_t */
+  clib_bihash_8_24_t ret;	/* (client ip, port, proto) -> dnsfilter_ret_t */
   volatile u32 n_ret;
   clib_bihash_8_8_t clients; /* client ip -> (window second << 32) | count */
   volatile u32 n_clients;

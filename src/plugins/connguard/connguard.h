@@ -111,6 +111,10 @@ typedef struct
 
 STATIC_ASSERT_SIZEOF (connguard_conn_t, CLIB_CACHE_LINE_BYTES);
 
+/* VLAN tags (TPID + TCI each, as on the wire, 0 = none) of a connection on
+ * a VLAN trunk link: the reset carries them too. */
+#define CONNGUARD_MAX_TAGS 2
+
 /* The rest of a conns[] slot, at the same index in conns_cold[]: written
  * once when the connection is tracked, read only to send a reset.
  * server_sw_if_index is the LAN interface the server is behind (where the
@@ -120,6 +124,7 @@ typedef struct
   u32 server_sw_if_index;
   u8 dst_mac[6];
   u8 src_mac[6];
+  u32 tags[CONNGUARD_MAX_TAGS];
 } connguard_conn_cold_t;
 
 /* A handshake in progress (client SYN seen) — see node.c's package doc
@@ -138,6 +143,7 @@ typedef struct
   u64 start_ns;
   u8 dst_mac[6];
   u8 src_mac[6];
+  u32 tags[CONNGUARD_MAX_TAGS];
 } connguard_halfopen_t;
 
 typedef struct

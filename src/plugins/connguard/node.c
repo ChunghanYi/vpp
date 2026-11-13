@@ -172,6 +172,7 @@ connguard_ho_claim (connguard_main_t *cm, u64 now, u32 cip, u32 sip, u16 cp,
 typedef struct
 {
   ethernet_header_t *eth;
+  u32 tags[CONNGUARD_MAX_TAGS]; /* the frame's VLAN tags, 0 = none */
   u32 cip, sip;
   u16 cp, sp;
   u32 seq;
@@ -181,6 +182,30 @@ typedef struct
   u8 fl;
   u8 sidx;
 } connguard_pkt_t;
+
+/* connguard_l3_offset: where the IPv4 header of the frame at eth starts —
+ * behind at most two VLAN tags (a VLAN trunk link) — or 0 when it is not
+ * IPv4. */
+static_always_inline u32
+connguard_l3_offset (ethernet_header_t *eth, u8 *end)
+{
+  u16 type = eth->type;
+  u32 off = sizeof (ethernet_header_t), i;
+
+  if (PREDICT_TRUE (type == clib_host_to_net_u16 (ETHERNET_TYPE_IP4)))
+    return off;
+  for (i = 0; i < CONNGUARD_MAX_TAGS &&
+	      (type == clib_host_to_net_u16 (ETHERNET_TYPE_VLAN) ||
+	       type == clib_host_to_net_u16 (ETHERNET_TYPE_DOT1AD));
+       i++)
+    {
+      if ((u8 *) eth + off + 4 > end)
+	return 0;
+      type = *(u16 *) ((u8 *) eth + off + 2);
+      off += 4;
+    }
+  return type == clib_host_to_net_u16 (ETHERNET_TYPE_IP4) ? off : 0;
+}
 
 /* connguard_parse: fills p for a TCP packet to or from a protected
  * service; 0 for anything else (left alone). is_c2s: client → server
@@ -193,10 +218,12 @@ connguard_parse (connguard_main_t *cm, vlib_buffer_t *b, int is_c2s,
   ethernet_header_t *eth = vlib_buffer_get_current (b);
   u8 *end = (u8 *) eth + b->current_length;
 
-  if ((u8 *) (eth + 1) > end ||
-      eth->type != clib_host_to_net_u16 (ETHERNET_TYPE_IP4))
+  if ((u8 *) (eth + 1) > end)
     return 0;
-  ip4_header_t *ip = (ip4_header_t *) (eth + 1);
+  u32 l2 = connguard_l3_offset (eth, end);
+  if (!l2)
+    return 0;
+  ip4_header_t *ip = (ip4_header_t *) ((u8 *) eth + l2);
   if ((u8 *) (ip + 1) > end || ip->protocol != IP_PROTOCOL_TCP)
     return 0;
   tcp_header_t *tcp = (tcp_header_t *) ((u8 *) ip + ip4_header_bytes (ip));
@@ -232,6 +259,8 @@ connguard_parse (connguard_main_t *cm, vlib_buffer_t *b, int is_c2s,
   u32 hdr_len = ip4_header_bytes (ip) + tcp_header_bytes (tcp);
   u32 tot_len = clib_net_to_host_u16 (ip->length);
   p->eth = eth;
+  p->tags[0] = p->tags[1] = 0;
+  clib_memcpy_fast (p->tags, (u8 *) eth + 12, l2 - sizeof (ethernet_header_t));
   p->sidx = (u8) val.value;
   p->plen = tot_len > hdr_len ? tot_len - hdr_len : 0;
   p->seq = clib_net_to_host_u32 (tcp->seq_number);
@@ -316,6 +345,8 @@ connguard_process (vlib_main_t *vm, connguard_main_t *cm,
 	  o->start_ns = now;
 	  clib_memcpy_fast (o->dst_mac, p->eth->dst_address, 6);
 	  clib_memcpy_fast (o->src_mac, p->eth->src_address, 6);
+	  o->tags[0] = p->tags[0];
+	  o->tags[1] = p->tags[1];
 	  CLIB_MEMORY_STORE_BARRIER ();
 	  o->used = 1;
 	  return 0;
@@ -350,6 +381,8 @@ connguard_process (vlib_main_t *vm, connguard_main_t *cm,
 	  cold->server_sw_if_index = o->server_sw_if_index;
 	  clib_memcpy_fast (cold->dst_mac, o->dst_mac, 6);
 	  clib_memcpy_fast (cold->src_mac, o->src_mac, 6);
+	  cold->tags[0] = o->tags[0];
+	  cold->tags[1] = o->tags[1];
 	  CLIB_MEMORY_STORE_BARRIER ();
 	  c->state = CONNGUARD_EST;
 	  o->used = 0;
