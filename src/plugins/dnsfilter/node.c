@@ -117,11 +117,19 @@ dnsfilter_count (vlib_main_t *vm, dnsfilter_main_t *dm, dnsfilter_counter_t c)
   vlib_increment_simple_counter (&dm->counters[c], vm->thread_index, 0, 1);
 }
 
-/* (ip, port, proto), all as on the wire. */
-static_always_inline u64
-dnsfilter_key (u32 ip, u16 port, u8 proto)
+/* The return table key: (ip, port, proto), all as on the wire, and for
+ * UDP the DNS ID right behind the UDP header (0 when the datagram is
+ * shorter); TCP keeps 0 — one entry per connection. */
+static_always_inline void
+dnsfilter_ret_key (clib_bihash_kv_16_24_t *kv, u32 ip, u16 port, u8 proto,
+		   const u8 *l4, const u8 *end)
 {
-  return ((u64) ip << 32) | ((u64) port << 16) | proto;
+  const u8 *dns = l4 + sizeof (udp_header_t);
+
+  kv->key[0] = ((u64) ip << 32) | ((u64) port << 16) | proto;
+  kv->key[1] = proto == IP_PROTOCOL_UDP && dns + 2 <= end ?
+		 clib_mem_unaligned (dns, u16) :
+		 0;
 }
 
 /* dnsfilter_toward_wan: the destination MAC is unknown in the bridge
@@ -194,14 +202,13 @@ dnsfilter_global_over (dnsfilter_main_t *dm, u32 now)
 /* dnsfilter_remember: stores / refreshes the client's return entry;
  * 0 = the table is full (the query is bridged unfiltered). */
 static_always_inline int
-dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth, u32 l2_len,
-		    u32 sw_if_index, u32 now)
+dnsfilter_remember (dnsfilter_main_t *dm, clib_bihash_kv_16_24_t *kv,
+		    const u8 *eth, u32 l2_len, u32 sw_if_index, u32 now)
 {
-  clib_bihash_kv_8_24_t kv, val;
+  clib_bihash_kv_16_24_t val;
   dnsfilter_ret_t r;
 
-  kv.key = key;
-  if (clib_bihash_search_8_24 (&dm->ret, &kv, &val))
+  if (clib_bihash_search_16_24 (&dm->ret, kv, &val))
     {
       if (dm->n_ret >= DNSFILTER_RET_MAX)
 	return 0;
@@ -213,10 +220,10 @@ dnsfilter_remember (dnsfilter_main_t *dm, u64 key, const u8 *eth, u32 l2_len,
   r.seen = (u16) now;
   r.tags[0] = r.tags[1] = 0;
   clib_memcpy_fast (r.tags, eth + 12, l2_len - sizeof (ethernet_header_t));
-  kv.value[0] = r.as_u64[0];
-  kv.value[1] = r.as_u64[1];
-  kv.value[2] = r.as_u64[2];
-  clib_bihash_add_del_8_24 (&dm->ret, &kv, 1 /* add/replace */);
+  kv->value[0] = r.as_u64[0];
+  kv->value[1] = r.as_u64[1];
+  kv->value[2] = r.as_u64[2];
+  clib_bihash_add_del_16_24 (&dm->ret, kv, 1 /* add/replace */);
   return 1;
 }
 
@@ -514,6 +521,7 @@ VLIB_NODE_FN (dnsfilter_lan_node)
       u8 *l4;
       u16 sport, dport = 0;
       u8 proto;
+      clib_bihash_kv_16_24_t rkv;
       dnsfilter_verdict_t verdict = DNSFILTER_VERDICT_PASS;
 
       if (n_left > 2)
@@ -653,12 +661,10 @@ VLIB_NODE_FN (dnsfilter_lan_node)
 	    goto done;
 	  }
       }
+      dnsfilter_ret_key (&rkv, ip->src_address.as_u32, sport, proto, l4, end);
       if ((dm->global_qps && dnsfilter_global_over (dm, now)) ||
-	  !dnsfilter_remember (dm,
-			       dnsfilter_key (ip->src_address.as_u32, sport,
-					      proto),
-			       eth, l2, vnet_buffer (b[0])->sw_if_index[VLIB_RX],
-			       now))
+	  !dnsfilter_remember (dm, &rkv, eth, l2,
+			       vnet_buffer (b[0])->sw_if_index[VLIB_RX], now))
 	{
 	  verdict = DNSFILTER_VERDICT_BYPASS;
 	  dnsfilter_count (vm, dm, DNSFILTER_CNT_BYPASS_GLOBAL_LIMIT);
@@ -725,7 +731,7 @@ VLIB_NODE_FN (dnsfilter_return_node)
       u8 *end = eth + b[0]->current_length;
       ethernet_header_t *e = (ethernet_header_t *) eth;
       ip4_header_t *ip = (ip4_header_t *) (e + 1);
-      clib_bihash_kv_8_24_t kv, val;
+      clib_bihash_kv_16_24_t kv, val;
       dnsfilter_ret_t r;
       u8 *l4;
 
@@ -736,13 +742,18 @@ VLIB_NODE_FN (dnsfilter_return_node)
 	  (ip->protocol != IP_PROTOCOL_UDP && ip->protocol != IP_PROTOCOL_TCP))
 	goto miss;
       l4 = (u8 *) ip + ip4_header_bytes (ip);
-      if (l4 + sizeof (udp_header_t) > end ||
+      /* a UDP answer carries its query's DNS ID: no DNS header, no way
+       * back */
+      if (l4 + sizeof (udp_header_t) +
+	      (ip->protocol == IP_PROTOCOL_UDP ? 2 : 0) >
+	    end ||
 	  ((udp_header_t *) l4)->src_port !=
 	    clib_host_to_net_u16 (DNSFILTER_PORT_DNS))
 	goto miss;
-      kv.key = dnsfilter_key (ip->dst_address.as_u32,
-			      ((udp_header_t *) l4)->dst_port, ip->protocol);
-      if (clib_bihash_search_8_24 (&dm->ret, &kv, &val))
+      dnsfilter_ret_key (&kv, ip->dst_address.as_u32,
+			 ((udp_header_t *) l4)->dst_port, ip->protocol, l4,
+			 end);
+      if (clib_bihash_search_16_24 (&dm->ret, &kv, &val))
 	goto miss;
       r.as_u64[0] = val.value[0];
       r.as_u64[1] = val.value[1];
@@ -762,7 +773,7 @@ VLIB_NODE_FN (dnsfilter_return_node)
       /* A UDP query has exactly one answer: free its entry now (a TCP
        * connection keeps it for the next query, the sweep ends it). */
       if (ip->protocol == IP_PROTOCOL_UDP &&
-	  clib_bihash_add_del_8_24 (&dm->ret, &kv, 0 /* del */) == 0)
+	  clib_bihash_add_del_16_24 (&dm->ret, &kv, 0 /* del */) == 0)
 	clib_atomic_fetch_sub (&dm->n_ret, 1);
       next[0] = DNSFILTER_NEXT_OUTPUT;
       dnsfilter_count (vm, dm, DNSFILTER_CNT_RETURNED);

@@ -28,12 +28,16 @@
 #include <vnet/ethernet/mac_address.h>
 #include <vppinfra/bihash_8_8.h>
 #include <vppinfra/bihash_8_16.h>
-#include <dnsfilter/dnsfilter_bihash_8_24.h>
+#include <dnsfilter/dnsfilter_bihash_16_24.h>
 
-/* Return table: one entry per outstanding query (client ip, port, proto).
- * A UDP entry is removed when its answer goes back; what is left (TCP,
- * unanswered queries) is swept after DNSFILTER_RET_TTL_SEC without a query
- * packet. At DNSFILTER_RET_MAX entries new queries bypass (forwarded
+/* Return table: one entry per outstanding query (client ip, port, proto,
+ * and for UDP the query's DNS ID: A and AAAA sent back to back from one
+ * socket, as glibc getaddrinfo does, need an entry each — with one shared
+ * entry the first answer would remove it and drop the second, and the
+ * client would wait for its retry, 5 s; TCP keeps ID 0, one entry per
+ * connection). A UDP entry is removed when its answer goes back; what is
+ * left (TCP, unanswered queries) is swept after DNSFILTER_RET_TTL_SEC
+ * without a query packet. At DNSFILTER_RET_MAX entries new queries bypass (forwarded
  * unfiltered) instead of evicting. 262,144 covers ~25,000 qps with answers
  * taking up to 10 s — same size as xdp_bridge's dnsf_ret_map. */
 #define DNSFILTER_RET_MAX	  262144
@@ -156,7 +160,7 @@ typedef enum
   DNSFILTER_ROLE_WAN,
 } dnsfilter_role_t;
 
-/* Return table value (dnsfilter_bihash_8_24): the client's MAC, the MAC
+/* Return table value (dnsfilter_bihash_16_24): the client's MAC, the MAC
  * it sent the query to (its gateway, the answer's source MAC), the LAN
  * port, the last time a query packet refreshed it (seconds, u16 wraps)
  * and the query's VLAN tags as they were on the wire (TPID + TCI each,
@@ -212,7 +216,7 @@ typedef struct
   u32 tap_sw_if_index;
   mac_address_t host_mac;
 
-  clib_bihash_8_24_t ret;	/* (client ip, port, proto) -> dnsfilter_ret_t */
+  clib_bihash_16_24_t ret; /* dnsfilter_ret_key () -> dnsfilter_ret_t */
   volatile u32 n_ret;
   clib_bihash_8_8_t clients; /* client ip -> (window second << 32) | count */
   volatile u32 n_clients;

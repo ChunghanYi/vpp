@@ -33,8 +33,8 @@
 #include <vpp/app/version.h>
 #include <dnsfilter/dnsfilter.h>
 
-/* the return table's bihash type (dnsfilter_bihash_8_24.h), built here */
-#include <dnsfilter/dnsfilter_bihash_8_24.h>
+/* the return table's bihash type (dnsfilter_bihash_16_24.h), built here */
+#include <dnsfilter/dnsfilter_bihash_16_24.h>
 #include <vppinfra/bihash_template.c>
 
 dnsfilter_main_t dnsfilter_main;
@@ -62,7 +62,7 @@ dnsfilter_counter_total (dnsfilter_main_t *dm, dnsfilter_counter_t c)
 static void
 dnsfilter_tables_init (dnsfilter_main_t *dm)
 {
-  clib_bihash_init_8_24 (&dm->ret, "dnsfilter return", DNSFILTER_RET_BUCKETS,
+  clib_bihash_init_16_24 (&dm->ret, "dnsfilter return", DNSFILTER_RET_BUCKETS,
 			 DNSFILTER_RET_MEMORY);
   clib_bihash_init_8_8 (&dm->clients, "dnsfilter clients",
 			DNSFILTER_CLIENT_BUCKETS, DNSFILTER_CLIENT_MEMORY);
@@ -77,7 +77,7 @@ dnsfilter_tables_init (dnsfilter_main_t *dm)
 static void
 dnsfilter_tables_reset (dnsfilter_main_t *dm)
 {
-  clib_bihash_free_8_24 (&dm->ret);
+  clib_bihash_free_16_24 (&dm->ret);
   clib_bihash_free_8_8 (&dm->clients);
   clib_bihash_free_8_8 (&dm->doh_ips);
   clib_bihash_free_8_8 (&dm->exempt);
@@ -89,17 +89,18 @@ dnsfilter_tables_reset (dnsfilter_main_t *dm)
 typedef struct
 {
   u32 now;
-  u64 *stale;
+  u64 *stale;			    /* 8-byte keys (clients, stats) */
+  clib_bihash_kv_16_24_t *stale_ret; /* return table keys */
 } dnsfilter_sweep_ctx_t;
 
 static int
-dnsfilter_ret_stale (clib_bihash_kv_8_24_t *kv, void *arg)
+dnsfilter_ret_stale (clib_bihash_kv_16_24_t *kv, void *arg)
 {
   dnsfilter_sweep_ctx_t *ctx = arg;
   dnsfilter_ret_t r = { .as_u64 = { kv->value[0], kv->value[1],
 				    kv->value[2] } };
   if ((u16) ((u16) ctx->now - r.seen) > DNSFILTER_RET_TTL_SEC)
-    vec_add1 (ctx->stale, kv->key);
+    vec_add1 (ctx->stale_ret, *kv);
   return BIHASH_WALK_CONTINUE;
 }
 
@@ -150,19 +151,17 @@ static void
 dnsfilter_sweep (vlib_main_t *vm, dnsfilter_main_t *dm)
 {
   dnsfilter_sweep_ctx_t ctx = { .now = dnsfilter_now_sec (vm) };
+  clib_bihash_kv_16_24_t *rk;
   u64 *k;
 
   if (dm->n_ret)
     {
-      clib_bihash_foreach_key_value_pair_8_24 (&dm->ret, dnsfilter_ret_stale,
-					       &ctx);
-      vec_foreach (k, ctx.stale)
-	{
-	  clib_bihash_kv_8_24_t kv = { .key = *k };
-	  if (clib_bihash_add_del_8_24 (&dm->ret, &kv, 0) == 0)
-	    clib_atomic_fetch_sub (&dm->n_ret, 1);
-	}
-      vec_reset_length (ctx.stale);
+      clib_bihash_foreach_key_value_pair_16_24 (&dm->ret, dnsfilter_ret_stale,
+						&ctx);
+      vec_foreach (rk, ctx.stale_ret)
+	if (clib_bihash_add_del_16_24 (&dm->ret, rk, 0) == 0)
+	  clib_atomic_fetch_sub (&dm->n_ret, 1);
+      vec_free (ctx.stale_ret);
     }
   if (dm->n_clients)
     {
